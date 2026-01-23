@@ -1,61 +1,116 @@
 import express from "express";
 import cors from "cors";
 import { nanoid } from "nanoid";
+import fs from "fs/promises";  // 🔥 FILE STORAGE
 
 const app = express();
-app.use(cors());
+
+// 🔥 FIXED CORS - Production ready
+app.use(cors({
+  origin: [
+    "http://localhost:3000",
+    "https://bgmi-esports.netlify.app",
+    "https://bgmi-esports.vercel.app",
+    "https://*.netlify.app",
+    "https://*.vercel.app"
+  ],
+  credentials: true
+}));
 app.use(express.json());
 
-/* ============================= DATABASE (IN-MEMORY) ============================= */
+/* ============================= PERSISTENT DATABASE ============================= */
 let users = [];
 let deposits = [];
-let userCounter = 10000;  // Starting number for BGMI-XXXXX
+let userCounter = 10000;
 
-/* ============================= REGISTER - BGMI ID FORMAT! ============================= */
-app.post("/api/register", (req, res) => {
-  const { email, username } = req.body;
-
-  if (!email || !username) {
-    return res.status(400).json({ error: "Email & Username required" });
+// 🔥 LOAD DATA ON START
+const loadData = async () => {
+  try {
+    await fs.mkdir("./data", { recursive: true });
+    
+    try {
+      const userData = await fs.readFile("./data/users.json", "utf8");
+      users = JSON.parse(userData);
+      userCounter = Math.max(10000, ...users.map(u => parseInt(u.profile_id.replace('BGMI-', ''))) + 1);
+      console.log("✅ Loaded", users.length, "users");
+    } catch {
+      console.log("📝 No users file - starting fresh");
+    }
+    
+    try {
+      const depositData = await fs.readFile("./data/deposits.json", "utf8");
+      deposits = JSON.parse(depositData);
+      console.log("✅ Loaded", deposits.length, "deposits");
+    } catch {
+      console.log("📝 No deposits file - starting fresh");
+    }
+  } catch (err) {
+    console.error("❌ Data load error:", err.message);
   }
+};
 
-  const cleanEmail = email.toLowerCase().trim();
-  const cleanUsername = username.trim();
-
-  const exists = users.find(u => u.email === cleanEmail);
-  if (exists) {
-    return res.status(400).json({ error: "User already exists" });
+// 🔥 SAVE DATA AFTER EVERY CHANGE
+const saveData = async () => {
+  try {
+    await fs.mkdir("./data", { recursive: true });
+    await fs.writeFile("./data/users.json", JSON.stringify(users, null, 2));
+    await fs.writeFile("./data/deposits.json", JSON.stringify(deposits, null, 2));
+  } catch (err) {
+    console.error("💾 Save error:", err.message);
   }
+};
 
-  // 🔥 BGMI-STYLE ID: BGMI-10246
-  const bgmiIdNumber = userCounter++;
-  const newUser = {
-    id: nanoid(10),
-    profile_id: `BGMI-${bgmiIdNumber}`,  // BGMI-10246 format!
-    username: cleanUsername,
-    email: cleanEmail,
-    balance: 0,
-    createdAt: new Date().toISOString(),
-    token: nanoid(32),
-  };
+/* ============================= REGISTER ============================= */
+app.post("/api/register", async (req, res) => {
+  try {
+    const { email, username } = req.body;
 
-  users.push(newUser);
-  console.log("✅ REGISTER:", newUser.profile_id, newUser.username, newUser.email);
+    if (!email || !username) {
+      return res.status(400).json({ error: "Email & Username required" });
+    }
 
-  res.json({
-    success: true,
-    token: newUser.token,
-    user: {
-      profile_id: newUser.profile_id,  // BGMI-10246
-      username: newUser.username,
-      email: newUser.email,
-      balance: newUser.balance,
-    },
-  });
+    const cleanEmail = email.toLowerCase().trim();
+    const cleanUsername = username.trim();
+
+    const exists = users.find(u => u.email === cleanEmail);
+    if (exists) {
+      return res.status(400).json({ error: "User already exists" });
+    }
+
+    const bgmiIdNumber = userCounter++;
+    const newUser = {
+      id: nanoid(10),
+      profile_id: `BGMI-${bgmiIdNumber}`,
+      username: cleanUsername,
+      email: cleanEmail,
+      balance: 0,
+      createdAt: new Date().toISOString(),
+      token: nanoid(32),
+    };
+
+    users.push(newUser);
+    await saveData();  // 🔥 SAVE IMMEDIATELY
+    
+    console.log("✅ REGISTER:", newUser.profile_id, newUser.username);
+    
+    res.json({
+      success: true,
+      token: newUser.token,
+      user: {
+        profile_id: newUser.profile_id,
+        username: newUser.username,
+        email: newUser.email,
+        balance: newUser.balance,
+      },
+    });
+  } catch (err) {
+    console.error("❌ Register error:", err);
+    res.status(500).json({ error: "Registration failed" });
+  }
 });
 
 /* ============================= LOGIN ============================= */
-app.post("/api/login", (req, res) => {
+app.post("/api/login", async (req, res) => {
   const { email } = req.body;
 
   if (!email) {
@@ -69,13 +124,15 @@ app.post("/api/login", (req, res) => {
   }
 
   user.token = nanoid(32);
-  console.log("🔐 LOGIN:", user.profile_id, user.username, user.email);
-
+  await saveData();
+  
+  console.log("🔐 LOGIN:", user.profile_id);
+  
   res.json({
     success: true,
     token: user.token,
     user: {
-      profile_id: user.profile_id,  // BGMI-10246
+      profile_id: user.profile_id,
       username: user.username,
       email: user.email,
       balance: user.balance,
@@ -84,52 +141,54 @@ app.post("/api/login", (req, res) => {
 });
 
 /* ============================= DEPOSIT ============================= */
-app.post("/api/deposit", (req, res) => {
-  const { email, amount, utr } = req.body;
+app.post("/api/deposit", async (req, res) => {
+  try {
+    const { email, amount, utr } = req.body;
 
-  console.log("💰 DEPOSIT REQUEST:", { email, amount, utr });
+    if (!email || !amount || !utr || Number(amount) <= 0) {
+      return res.status(400).json({ error: "Invalid deposit data" });
+    }
 
-  if (!email || !amount || !utr || Number(amount) <= 0) {
-    return res.status(400).json({ error: "Invalid deposit data" });
+    const cleanEmail = email.toLowerCase().trim();
+    const user = users.find(u => u.email === cleanEmail);
+
+    if (!user) {
+      return res.status(404).json({ error: "User not found. Register first." });
+    }
+
+    const deposit = {
+      id: nanoid(10),
+      profile_id: user.profile_id,
+      username: user.username,
+      email: user.email,
+      amount: Number(amount),
+      utr: utr.trim(),
+      status: "pending",
+      createdAt: new Date().toISOString(),
+    };
+
+    deposits.push(deposit);
+    await saveData();  // 🔥 SAVE
+    
+    console.log("✅ DEPOSIT:", deposit.profile_id, `₹${amount}`);
+    
+    res.json({
+      success: true,
+      message: "Deposit created - pending approval",
+      deposit,
+    });
+  } catch (err) {
+    res.status(500).json({ error: "Deposit failed" });
   }
-
-  const cleanEmail = email.toLowerCase().trim();
-  const user = users.find(u => u.email === cleanEmail);
-
-  if (!user) {
-    console.log("❌ USER NOT FOUND:", cleanEmail);
-    console.log("📋 USERS:", users.map(u => u.profile_id));
-    return res.status(404).json({ error: "User not found. Register first." });
-  }
-
-  const deposit = {
-    id: nanoid(10),
-    profile_id: user.profile_id,  // BGMI-10246 format!
-    username: user.username,
-    email: user.email,
-    amount: Number(amount),
-    utr: utr.trim(),
-    status: "pending",
-    createdAt: new Date().toISOString(),
-  };
-
-  deposits.push(deposit);
-  console.log("✅ DEPOSIT:", deposit.profile_id, `₹${amount}`);
-
-  res.json({
-    success: true,
-    message: "Deposit created - pending approval",
-    deposit,
-  });
 });
 
 /* ============================= ADMIN ENDPOINTS ============================= */
 app.get("/api/admin/deposits", (req, res) => {
-  console.log("👁️ ADMIN: Loading deposits...");
+  console.log("👁️ ADMIN deposits:", deposits.length);
   res.json({ deposits: deposits.slice().reverse() });
 });
 
-app.put("/api/admin/deposit/:id/approve", (req, res) => {
+app.put("/api/admin/deposit/:id/approve", async (req, res) => {
   const deposit = deposits.find(d => d.id === req.params.id);
   if (!deposit) return res.status(404).json({ error: "Deposit not found" });
 
@@ -141,62 +200,63 @@ app.put("/api/admin/deposit/:id/approve", (req, res) => {
   const user = users.find(u => u.profile_id === deposit.profile_id);
   if (user) {
     user.balance += deposit.amount;
-    console.log(`💰 APPROVED: ${user.profile_id} +₹${deposit.amount} (New balance: ₹${user.balance})`);
   }
-
+  
+  await saveData();  // 🔥 SAVE
+  
+  console.log(`💰 APPROVED: ${deposit.profile_id} +₹${deposit.amount}`);
   res.json({ success: true, balance: user ? user.balance : 0 });
 });
 
-app.put("/api/admin/deposit/:id/reject", (req, res) => {
+app.put("/api/admin/deposit/:id/reject", async (req, res) => {
   const deposit = deposits.find(d => d.id === req.params.id);
   if (!deposit) return res.status(404).json({ error: "Deposit not found" });
 
   deposit.status = "rejected";
-  console.log(`❌ REJECTED: ${deposit.profile_id} ₹${deposit.amount}`);
+  await saveData();
+  
+  console.log(`❌ REJECTED: ${deposit.profile_id}`);
   res.json({ success: true });
 });
 
-// 🔥 ADMIN USERS - FULL DATA WITH ID FIELD
 app.get("/api/admin/users", (req, res) => {
-  console.log("👥 ADMIN: Loading all users...");
-  console.log("📊 Total users:", users.length);
-  
+  console.log("👥 ADMIN users:", users.length);
   res.json({
     users: users.map(u => ({
-      id: u.id,                           // nanoid(10) - DELETE के लिए
-      profile_id: u.profile_id,           // BGMI-10001
-      username: u.username,               // Akash
-      email: u.email,                     // wegab86429@lawicon.com
-      balance: u.balance,                 // 0 या approved deposits
-      createdAt: u.createdAt              // ISO timestamp
+      id: u.id,
+      profile_id: u.profile_id,
+      username: u.username,
+      email: u.email,
+      balance: u.balance,
+      createdAt: u.createdAt
     }))
   });
 });
 
-// 🔥 DELETE USER ENDPOINT
-app.delete("/api/admin/users/:id", (req, res) => {
+app.delete("/api/admin/users/:id", async (req, res) => {
   const userId = req.params.id;
   const userIndex = users.findIndex(u => u.id === userId);
   
   if (userIndex === -1) {
-    console.log("❌ ADMIN: User not found:", userId);
     return res.status(404).json({ error: "User not found" });
   }
   
   const deletedUser = users.splice(userIndex, 1)[0];
-  console.log("🗑️ DELETED USER:", deletedUser.profile_id, deletedUser.username, deletedUser.email);
+  await saveData();
   
-  res.json({ 
-    success: true, 
-    message: `User ${deletedUser.profile_id} deleted successfully` 
-  });
+  console.log("🗑️ DELETED:", deletedUser.profile_id);
+  res.json({ success: true, message: `User ${deletedUser.profile_id} deleted` });
 });
 
 /* ============================= SERVER START ============================= */
-const PORT = 5001;
-app.listen(PORT, () => {
-  console.log(`🔥 BGMI Server: http://localhost:${PORT}`);
-  console.log("👥 Users:", users.length);
-  console.log("💰 Deposits:", deposits.length);
-  console.log("🟢 Admin endpoints ready: /api/admin/users, /api/admin/deposits");
+const PORT = process.env.PORT || 5001;
+
+loadData().then(() => {
+  app.listen(PORT, () => {
+    console.log(`🔥 BGMI Server: PORT ${PORT}`);
+    console.log("👥 Users:", users.length);
+    console.log("💰 Deposits:", deposits.length);
+    console.log("🟢 Admin endpoints ready!");
+    console.log("💾 Persistent storage: ./data/");
+  });
 });
