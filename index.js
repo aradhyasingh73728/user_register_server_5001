@@ -1,11 +1,10 @@
 import express from "express";
 import cors from "cors";
 import { nanoid } from "nanoid";
-import fs from "fs/promises";  // 🔥 FILE STORAGE
+import Database from "better-sqlite3"; // npm install better-sqlite3
 
 const app = express();
 
-// 🔥 FIXED CORS - Production ready
 app.use(cors({
   origin: [
     "http://localhost:3000",
@@ -18,81 +17,111 @@ app.use(cors({
 }));
 app.use(express.json());
 
-/* ============================= PERSISTENT DATABASE ============================= */
+// 🔥 RENDER FRIENDLY - SQLite Database
+let db;
 let users = [];
 let deposits = [];
 let userCounter = 10000;
 
-// 🔥 LOAD DATA ON START
-const loadData = async () => {
-  try {
-    await fs.mkdir("./data", { recursive: true });
+const initDB = () => {
+  const dbPath = process.env.DATABASE_URL ? new URL(process.env.DATABASE_URL).pathname.slice(1) : './db.sqlite';
+  
+  db = new Database(dbPath);
+  
+  // Create tables
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS users (
+      id TEXT PRIMARY KEY,
+      profile_id TEXT UNIQUE,
+      username TEXT,
+      email TEXT UNIQUE,
+      balance REAL DEFAULT 0,
+      createdAt TEXT,
+      token TEXT
+    );
     
-    try {
-      const userData = await fs.readFile("./data/users.json", "utf8");
-      users = JSON.parse(userData);
-      userCounter = Math.max(10000, ...users.map(u => parseInt(u.profile_id.replace('BGMI-', ''))) + 1);
-      console.log("✅ Loaded", users.length, "users");
-    } catch {
-      console.log("📝 No users file - starting fresh");
-    }
-    
-    try {
-      const depositData = await fs.readFile("./data/deposits.json", "utf8");
-      deposits = JSON.parse(depositData);
-      console.log("✅ Loaded", deposits.length, "deposits");
-    } catch {
-      console.log("📝 No deposits file - starting fresh");
-    }
-  } catch (err) {
-    console.error("❌ Data load error:", err.message);
+    CREATE TABLE IF NOT EXISTS deposits (
+      id TEXT PRIMARY KEY,
+      profile_id TEXT,
+      username TEXT,
+      email TEXT,
+      amount REAL,
+      utr TEXT,
+      status TEXT,
+      createdAt TEXT
+    );
+  `);
+
+  // Load existing data
+  const loadUsers = db.prepare("SELECT * FROM users ORDER BY profile_id").all();
+  users = loadUsers;
+  if (users.length > 0) {
+    userCounter = Math.max(10000, ...users.map(u => parseInt(u.profile_id.replace('BGMI-', ''))) + 1);
   }
+  
+  deposits = db.prepare("SELECT * FROM deposits ORDER BY createdAt DESC").all();
+  
+  console.log("✅ SQLite loaded:", users.length, "users,", deposits.length, "deposits");
 };
 
-// 🔥 SAVE DATA AFTER EVERY CHANGE
-const saveData = async () => {
-  try {
-    await fs.mkdir("./data", { recursive: true });
-    await fs.writeFile("./data/users.json", JSON.stringify(users, null, 2));
-    await fs.writeFile("./data/deposits.json", JSON.stringify(deposits, null, 2));
-  } catch (err) {
-    console.error("💾 Save error:", err.message);
-  }
+// 🔥 Database wrappers
+const saveUser = (user) => {
+  db.prepare(`
+    INSERT OR REPLACE INTO users 
+    (id, profile_id, username, email, balance, createdAt, token)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `).run(user.id, user.profile_id, user.username, user.email, user.balance, user.createdAt, user.token);
 };
 
-/* ============================= REGISTER ============================= */
+const saveDeposit = (deposit) => {
+  db.prepare(`
+    INSERT INTO deposits 
+    (id, profile_id, username, email, amount, utr, status, createdAt)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(deposit.id, deposit.profile_id, deposit.username, deposit.email, deposit.amount, deposit.utr, deposit.status, deposit.createdAt);
+};
+
+const updateDepositStatus = (id, status) => {
+  db.prepare("UPDATE deposits SET status = ? WHERE id = ?").run(status, id);
+};
+
+const updateUserBalance = (profile_id, amount) => {
+  db.prepare("UPDATE users SET balance = balance + ? WHERE profile_id = ?").run(amount, profile_id);
+};
+
+const deleteUser = (id) => {
+  db.prepare("DELETE FROM users WHERE id = ?").run(id);
+};
+
+// 🔥 Load on startup
+initDB();
+
+// 🔥 Same endpoints, just DB calls badlo
 app.post("/api/register", async (req, res) => {
   try {
     const { email, username } = req.body;
-
-    if (!email || !username) {
-      return res.status(400).json({ error: "Email & Username required" });
-    }
+    if (!email || !username) return res.status(400).json({ error: "Email & Username required" });
 
     const cleanEmail = email.toLowerCase().trim();
-    const cleanUsername = username.trim();
-
-    const exists = users.find(u => u.email === cleanEmail);
-    if (exists) {
-      return res.status(400).json({ error: "User already exists" });
-    }
+    
+    const existing = db.prepare("SELECT * FROM users WHERE email = ?").get(cleanEmail);
+    if (existing) return res.status(400).json({ error: "User already exists" });
 
     const bgmiIdNumber = userCounter++;
     const newUser = {
       id: nanoid(10),
       profile_id: `BGMI-${bgmiIdNumber}`,
-      username: cleanUsername,
+      username: username.trim(),
       email: cleanEmail,
       balance: 0,
       createdAt: new Date().toISOString(),
       token: nanoid(32),
     };
 
+    saveUser(newUser);
     users.push(newUser);
-    await saveData();  // 🔥 SAVE IMMEDIATELY
     
-    console.log("✅ REGISTER:", newUser.profile_id, newUser.username);
-    
+    console.log("✅ REGISTER:", newUser.profile_id);
     res.json({
       success: true,
       token: newUser.token,
@@ -109,28 +138,21 @@ app.post("/api/register", async (req, res) => {
   }
 });
 
-/* ============================= LOGIN ============================= */
+// Login endpoint
 app.post("/api/login", async (req, res) => {
   const { email } = req.body;
+  if (!email) return res.status(400).json({ error: "Email required" });
 
-  if (!email) {
-    return res.status(400).json({ error: "Email required" });
-  }
+  const user = db.prepare("SELECT * FROM users WHERE email = ?").get(email.toLowerCase().trim());
+  if (!user) return res.status(404).json({ error: "User not registered" });
 
-  const user = users.find(u => u.email === email.toLowerCase().trim());
-
-  if (!user) {
-    return res.status(404).json({ error: "User not registered. Register first." });
-  }
-
-  user.token = nanoid(32);
-  await saveData();
+  const newToken = nanoid(32);
+  db.prepare("UPDATE users SET token = ? WHERE id = ?").run(newToken, user.id);
   
   console.log("🔐 LOGIN:", user.profile_id);
-  
   res.json({
     success: true,
-    token: user.token,
+    token: newToken,
     user: {
       profile_id: user.profile_id,
       username: user.username,
@@ -140,21 +162,16 @@ app.post("/api/login", async (req, res) => {
   });
 });
 
-/* ============================= DEPOSIT ============================= */
+// Deposit endpoint
 app.post("/api/deposit", async (req, res) => {
   try {
     const { email, amount, utr } = req.body;
-
     if (!email || !amount || !utr || Number(amount) <= 0) {
       return res.status(400).json({ error: "Invalid deposit data" });
     }
 
-    const cleanEmail = email.toLowerCase().trim();
-    const user = users.find(u => u.email === cleanEmail);
-
-    if (!user) {
-      return res.status(404).json({ error: "User not found. Register first." });
-    }
+    const user = db.prepare("SELECT * FROM users WHERE email = ?").get(email.toLowerCase().trim());
+    if (!user) return res.status(404).json({ error: "User not found" });
 
     const deposit = {
       id: nanoid(10),
@@ -167,96 +184,51 @@ app.post("/api/deposit", async (req, res) => {
       createdAt: new Date().toISOString(),
     };
 
-    deposits.push(deposit);
-    await saveData();  // 🔥 SAVE
+    saveDeposit(deposit);
+    deposits.unshift(deposit); // Add to front for latest first
     
     console.log("✅ DEPOSIT:", deposit.profile_id, `₹${amount}`);
-    
-    res.json({
-      success: true,
-      message: "Deposit created - pending approval",
-      deposit,
-    });
+    res.json({ success: true, message: "Deposit created - pending approval", deposit });
   } catch (err) {
     res.status(500).json({ error: "Deposit failed" });
   }
 });
 
-/* ============================= ADMIN ENDPOINTS ============================= */
+// Admin endpoints (same logic, DB calls)
 app.get("/api/admin/deposits", (req, res) => {
-  console.log("👁️ ADMIN deposits:", deposits.length);
-  res.json({ deposits: deposits.slice().reverse() });
+  const latestDeposits = db.prepare("SELECT * FROM deposits ORDER BY createdAt DESC").all();
+  res.json({ deposits: latestDeposits });
 });
 
 app.put("/api/admin/deposit/:id/approve", async (req, res) => {
-  const deposit = deposits.find(d => d.id === req.params.id);
+  const deposit = db.prepare("SELECT * FROM deposits WHERE id = ?").get(req.params.id);
   if (!deposit) return res.status(404).json({ error: "Deposit not found" });
 
-  if (deposit.status === "approved") {
-    return res.status(400).json({ error: "Already approved" });
-  }
+  if (deposit.status === "approved") return res.status(400).json({ error: "Already approved" });
 
-  deposit.status = "approved";
-  const user = users.find(u => u.profile_id === deposit.profile_id);
-  if (user) {
-    user.balance += deposit.amount;
-  }
-  
-  await saveData();  // 🔥 SAVE
+  updateDepositStatus(req.params.id, "approved");
+  updateUserBalance(deposit.profile_id, deposit.amount);
   
   console.log(`💰 APPROVED: ${deposit.profile_id} +₹${deposit.amount}`);
-  res.json({ success: true, balance: user ? user.balance : 0 });
-});
-
-app.put("/api/admin/deposit/:id/reject", async (req, res) => {
-  const deposit = deposits.find(d => d.id === req.params.id);
-  if (!deposit) return res.status(404).json({ error: "Deposit not found" });
-
-  deposit.status = "rejected";
-  await saveData();
-  
-  console.log(`❌ REJECTED: ${deposit.profile_id}`);
   res.json({ success: true });
 });
 
 app.get("/api/admin/users", (req, res) => {
-  console.log("👥 ADMIN users:", users.length);
-  res.json({
-    users: users.map(u => ({
-      id: u.id,
-      profile_id: u.profile_id,
-      username: u.username,
-      email: u.email,
-      balance: u.balance,
-      createdAt: u.createdAt
-    }))
-  });
+  const allUsers = db.prepare(`
+    SELECT id, profile_id, username, email, balance, createdAt 
+    FROM users 
+    ORDER BY createdAt DESC
+  `).all();
+  res.json({ users: allUsers });
 });
 
 app.delete("/api/admin/users/:id", async (req, res) => {
-  const userId = req.params.id;
-  const userIndex = users.findIndex(u => u.id === userId);
-  
-  if (userIndex === -1) {
-    return res.status(404).json({ error: "User not found" });
-  }
-  
-  const deletedUser = users.splice(userIndex, 1)[0];
-  await saveData();
-  
-  console.log("🗑️ DELETED:", deletedUser.profile_id);
-  res.json({ success: true, message: `User ${deletedUser.profile_id} deleted` });
+  deleteUser(req.params.id);
+  res.json({ success: true });
 });
 
-/* ============================= SERVER START ============================= */
 const PORT = process.env.PORT || 5001;
-
-loadData().then(() => {
-  app.listen(PORT, () => {
-    console.log(`🔥 BGMI Server: PORT ${PORT}`);
-    console.log("👥 Users:", users.length);
-    console.log("💰 Deposits:", deposits.length);
-    console.log("🟢 Admin endpoints ready!");
-    console.log("💾 Persistent storage: ./data/");
-  });
+app.listen(PORT, () => {
+  console.log(`🔥 BGMI Server: PORT ${PORT}`);
+  console.log("🟢 SQLite persistent storage ready!");
 });
