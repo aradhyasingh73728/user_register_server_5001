@@ -2,10 +2,17 @@ import express from "express";
 import cors from "cors";
 import { nanoid } from "nanoid";
 import fs from "fs/promises";
+import { createClient } from '@supabase/supabase-js';
+
+// 🔥 Supabase connection
+const supabase = createClient(
+  'https://wrkrtpgfzebcmbjreyra.supabase.co',
+  'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Indya3J0cGdmemViY21ianJleXJhIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Njc3NzMzNDcsImV4cCI6MjA4MzM0OTM0N30.67y2ZZmtMPQugtAHj3fniFj1wgcy3hOjcG5xg3yEEj0'
+);
 
 const app = express();
 
-/* ============================= CORS (FINAL FIX) ============================= */
+/* ============================= CORS ============================= */
 app.use(
   cors({
     origin: true,
@@ -15,15 +22,14 @@ app.use(
   })
 );
 
-// 🔥 PRE-FLIGHT FIX
+// 🚀 Pre-flight fix
 app.options("*", cors());
-
 app.use(express.json());
 
 /* ============================= DATABASE ============================= */
 let users = [];
 let deposits = [];
-let userCounter = 8523; // ← BGMI-8524, BGMI-8525... se start hoga
+let userCounter = 8523; // BGMI-8524, BGMI-8525... se start
 
 /* ============================= LOAD DATA ============================= */
 const loadData = async () => {
@@ -33,7 +39,7 @@ const loadData = async () => {
     try {
       const userData = await fs.readFile("./data/users.json", "utf8");
       users = JSON.parse(userData);
-      // Existing users se last BGMI-XXXX leke usse aage se set karo
+
       userCounter =
         Math.max(
           8523,
@@ -69,9 +75,9 @@ const saveData = async () => {
 /* ============================= REGISTER ============================= */
 app.post("/api/register", async (req, res) => {
   try {
-    const { email, username } = req.body;
-    if (!email || !username)
-      return res.status(400).json({ error: "Email & Username required" });
+    const { email, username, password } = req.body;
+    if (!email || !username || !password)
+      return res.status(400).json({ error: "Email, Username & Password required" });
 
     const cleanEmail = email.toLowerCase().trim();
     if (users.find((u) => u.email === cleanEmail)) {
@@ -80,7 +86,7 @@ app.post("/api/register", async (req, res) => {
 
     const user = {
       id: nanoid(10),
-      profile_id: `BGMI-${userCounter++}`, // BGMI-8524, BGMI-8525...
+      profile_id: `BGMI-${userCounter++}`,
       username: username.trim(),
       email: cleanEmail,
       balance: 0,
@@ -91,8 +97,22 @@ app.post("/api/register", async (req, res) => {
     users.push(user);
     await saveData();
 
+    // ✅ Supabase me bhi save
+    const istTime = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
+    const { error } = await supabase.from('registeruser').insert([{
+      profile_id: user.profile_id,
+      username: user.username,
+      email: user.email,
+      balance: user.balance,
+      register_time_ist: istTime,
+      "User Password": password.trim()
+    }]);
+
+    if (error) console.error('Supabase register error:', error);
+
     res.json({ success: true, user });
-  } catch {
+  } catch (err) {
+    console.error('Register error:', err);
     res.status(500).json({ error: "Registration failed" });
   }
 });
@@ -112,7 +132,7 @@ app.post("/api/login", async (req, res) => {
   res.json({ success: true, user });
 });
 
-/* ============================= DEPOSIT (AUTO REGISTER FIX) ============================= */
+/* ============================= DEPOSIT ============================= */
 app.post("/api/deposit", async (req, res) => {
   try {
     const { email, amount, utr } = req.body;
@@ -122,12 +142,11 @@ app.post("/api/deposit", async (req, res) => {
 
     const cleanEmail = email.toLowerCase().trim();
 
-    // 🔥 AUTO CREATE USER IF MISSING
     let user = users.find((u) => u.email === cleanEmail);
     if (!user) {
       user = {
         id: nanoid(10),
-        profile_id: `BGMI-${userCounter++}`, // BGMI-8524, 8525...
+        profile_id: `BGMI-${userCounter++}`,
         username: cleanEmail.split("@")[0],
         email: cleanEmail,
         balance: 0,
@@ -161,11 +180,27 @@ app.post("/api/deposit", async (req, res) => {
   }
 });
 
-/* ============================= ADMIN ============================= */
-app.get("/api/admin/users", (req, res) => {
-  res.json({ users });
+/* ============================= ADMIN USERS - SUPABASE SE DATA ============================= */
+app.get("/api/admin/users", async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('registeruser')
+      .select('*')
+      .order('id', { ascending: false });
+
+    if (error) {
+      console.error('Supabase fetch error:', error);
+      return res.status(500).json({ users: [] });
+    }
+
+    res.json({ users: data });
+  } catch (err) {
+    console.error('Admin users error:', err);
+    res.status(500).json({ users: [] });
+  }
 });
 
+/* ============================= ADMIN DEPOSITS ============================= */
 app.get("/api/admin/deposits", (req, res) => {
   res.json({ deposits: deposits.slice().reverse() });
 });
@@ -185,7 +220,7 @@ app.put("/api/admin/deposit/:id/approve", async (req, res) => {
   res.json({ success: true });
 });
 
-/* ============================= START ============================= */
+/* ============================= START SERVER ============================= */
 const PORT = process.env.PORT || 5001;
 
 loadData().then(() => {
