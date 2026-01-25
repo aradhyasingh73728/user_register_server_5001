@@ -9,9 +9,11 @@
     "dev": "node index.js"
   },
   "dependencies": {
+    "@supabase/supabase-js": "^2.91.1",
     "better-sqlite3": "^12.6.2",
-    "cors": "^2.8.5",
-    "express": "^4.19.2",
+    "cors": "^2.8.6",
+    "dotenv": "^17.2.3",
+    "express": "^4.22.1",
     "nanoid": "^5.1.6"
   }
 }

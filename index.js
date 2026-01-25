@@ -8,7 +8,7 @@ const app = express();
 /* ============================= CORS (FINAL FIX) ============================= */
 app.use(
   cors({
-    origin: true, // 🔥 allow ALL origins safely
+    origin: true,
     credentials: true,
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
@@ -23,7 +23,7 @@ app.use(express.json());
 /* ============================= DATABASE ============================= */
 let users = [];
 let deposits = [];
-let userCounter = 10000;
+let userCounter = 8523; // ← BGMI-8524, BGMI-8525... se start hoga
 
 /* ============================= LOAD DATA ============================= */
 const loadData = async () => {
@@ -33,16 +33,18 @@ const loadData = async () => {
     try {
       const userData = await fs.readFile("./data/users.json", "utf8");
       users = JSON.parse(userData);
+      // Existing users se last BGMI-XXXX leke usse aage se set karo
       userCounter =
         Math.max(
-          10000,
-          ...users.map((u) =>
-            parseInt(u.profile_id.replace("BGMI-", ""))
-          )
+          8523,
+          ...users.map((u) => {
+            const numStr = u.profile_id.replace("BGMI-", "");
+            return parseInt(numStr, 10) || 8523;
+          })
         ) + 1;
       console.log("✅ Users loaded:", users.length);
     } catch {
-      console.log("📝 No users file");
+      console.log("📝 No users file, starting from BGMI-8524...");
     }
 
     try {
@@ -78,7 +80,7 @@ app.post("/api/register", async (req, res) => {
 
     const user = {
       id: nanoid(10),
-      profile_id: `BGMI-${userCounter++}`,
+      profile_id: `BGMI-${userCounter++}`, // BGMI-8524, BGMI-8525...
       username: username.trim(),
       email: cleanEmail,
       balance: 0,
@@ -100,9 +102,7 @@ app.post("/api/login", async (req, res) => {
   const { email } = req.body;
   if (!email) return res.status(400).json({ error: "Email required" });
 
-  const user = users.find(
-    (u) => u.email === email.toLowerCase().trim()
-  );
+  const user = users.find((u) => u.email === email.toLowerCase().trim());
 
   if (!user) return res.status(404).json({ error: "User not found" });
 
@@ -127,7 +127,7 @@ app.post("/api/deposit", async (req, res) => {
     if (!user) {
       user = {
         id: nanoid(10),
-        profile_id: `BGMI-${userCounter++}`,
+        profile_id: `BGMI-${userCounter++}`, // BGMI-8524, 8525...
         username: cleanEmail.split("@")[0],
         email: cleanEmail,
         balance: 0,
