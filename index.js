@@ -8,35 +8,17 @@ const supabaseUrl = process.env.SUPABASE_URL || "https://wrkrtpgfzebcmbjreyra.su
 const supabaseKey = process.env.SUPABASE_ANON_KEY || "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Indya3J0cGdmemViY21ianJleXJhIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Njc3NzMzNDcsImV4cCI6MjA4MzM0OTM0N30.67y2ZZmtMPQugtAHj3fniFj1wgcy3hOjcG5xg3yEEj0";
 
 const supabase = createClient(supabaseUrl, supabaseKey);
-
 const app = express();
 
-// 🔥 PRODUCTION CORS: Multiple origins allowed
-const allowedOrigins = [
-  "https://bgmi-esports-app.onrender.com",  // Frontend Render
-  "http://localhost:3000",                   // Local dev
-  "https://bgmi-esports-app.vercel.app",    // Vercel (future)
-  "https://your-domain.com"                 // Custom domain
-];
-
+// 🔥 ADMIN PANEL + REGISTER = 100% CORS FIXED
 app.use(cors({
-  origin: (origin, callback) => {
-    // Allow requests with no origin (mobile apps, Postman, etc.)
-    if (!origin) return callback(null, true);
-    
-    if (allowedOrigins.includes(origin)) {
-      return callback(null, true);
-    } else {
-      console.log("🚫 Blocked origin:", origin);
-      return callback(new Error("Not allowed by CORS"));
-    }
-  },
+  origin: true,  // ✅ ALL ORIGINS ALLOWED (Register + Admin dono chalega!)
   credentials: true,
   methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization"]
 }));
 
-app.options("*", cors()); // Pre-flight requests
+app.options("*", cors()); 
 app.use(express.json());
 
 let userCounter = 8523;
@@ -93,16 +75,13 @@ app.post("/api/register", async (req, res) => {
     while (attempts < 100) {
       profile_id = `BGMI-${(userCounter++).toString().padStart(4, '0')}`;
       
-      let existingProfile = null;
       const { data: profileCheck } = await supabase
         .from("registeruser")
         .select("id")
         .eq("profile_id", profile_id)
         .maybeSingle();
       
-      existingProfile = profileCheck;
-      
-      if (!existingProfile) break;
+      if (!profileCheck) break;
       attempts++;
     }
 
@@ -166,18 +145,50 @@ app.post("/api/login", async (req, res) => {
   }
 });
 
-// ADMIN USERS
+// 🔥 ADMIN USERS (ENHANCED LOGGING)
 app.get("/api/admin/users", async (req, res) => {
   try {
+    console.log("🔍 ADMIN /api/admin/users CALLED from IP:", req.ip, "Origin:", req.headers.origin);
+    
     const { data, error } = await supabase
       .from("registeruser")
       .select("*")
       .order("id", { ascending: false });
-    if (error) return res.status(500).json({ users: [] });
-    console.log("🟢 Admin users:", data?.length || 0);
+    
+    if (error) {
+      console.error("💥 Admin users ERROR:", error.message);
+      return res.status(500).json({ users: [], error: error.message });
+    }
+    
+    console.log("🟢 Admin users:", data?.length || 0, "users sent");
     res.json({ users: data || [] });
   } catch (err) {
+    console.error("💥 Admin users CRASH:", err);
     res.status(500).json({ users: [] });
+  }
+});
+
+// DELETE USER (Admin Panel)
+app.delete("/api/admin/users/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    console.log("🗑️ DELETE user:", id);
+    
+    const { error } = await supabase
+      .from("registeruser")
+      .delete()
+      .eq("id", id);
+    
+    if (error) {
+      console.error("💥 Delete ERROR:", error.message);
+      return res.status(500).json({ error: error.message });
+    }
+    
+    console.log("✅ User deleted:", id);
+    res.json({ success: true });
+  } catch (err) {
+    console.error("💥 Delete CRASH:", err);
+    res.status(500).json({ error: "Delete failed" });
   }
 });
 
@@ -189,8 +200,10 @@ app.get("/health", (req, res) => {
 const PORT = process.env.PORT || 5001;
 initCounter().then(() => {
   app.listen(PORT, "0.0.0.0", () => {
-    console.log(`🔥 BGMI Server on port ${PORT}`);
+    console.log(`🔥 BGMI Server running on port ${PORT}`);
     console.log("✅ Supabase connected - Production Ready!");
-    console.log("✅ CORS enabled for:", allowedOrigins.join(", "));
+    console.log("✅ CORS: ALL ORIGINS ALLOWED ✅");
+    console.log("✅ Admin Panel: /api/admin/users ✅");
+    console.log("✅ Test: https://main-server-firebase.onrender.com/health");
   });
 });
