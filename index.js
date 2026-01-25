@@ -108,11 +108,17 @@ app.post("/api/register", async (req, res) => {
       "User Password": password.trim()
     }]);
 
-    if (error) console.error('Supabase register error:', error);
+    // ✅ Error agar ho toh console pe ayega
+    if (error) {
+      console.error('💥 Supabase insert error:', error);
+      console.error('💥 Error details:', error.message);
+    } else {
+      console.log('✅ Supabase: Data inserted successfully');
+    }
 
     res.json({ success: true, user });
   } catch (err) {
-    console.error('Register error:', err);
+    console.error('💥 Register error:', err);
     res.status(500).json({ error: "Registration failed" });
   }
 });
@@ -180,8 +186,9 @@ app.post("/api/deposit", async (req, res) => {
   }
 });
 
-/* ============================= ADMIN USERS - SUPABASE SE DATA ============================= */
+/* ============================= ADMIN USERS ============================= */
 app.get("/api/admin/users", async (req, res) => {
+  console.log("🟢 /api/admin/users requested");
   try {
     const { data, error } = await supabase
       .from('registeruser')
@@ -189,13 +196,15 @@ app.get("/api/admin/users", async (req, res) => {
       .order('id', { ascending: false });
 
     if (error) {
-      console.error('Supabase fetch error:', error);
+      console.error('🔴 Supabase fetch error:', error);
+      console.error('🔴 Error message:', error.message);
       return res.status(500).json({ users: [] });
     }
 
+    console.log('🟢 Data fetched from Supabase:', data);
     res.json({ users: data });
   } catch (err) {
-    console.error('Admin users error:', err);
+    console.error('🔴 Admin users error:', err);
     res.status(500).json({ users: [] });
   }
 });
@@ -228,3 +237,6 @@ loadData().then(() => {
     console.log(`🔥 BGMI Server running on ${PORT}`);
   });
 });
+
+// 🚀 Debug check
+console.log("🚀 Server starting. PORT:", PORT);
