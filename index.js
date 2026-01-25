@@ -3,13 +3,40 @@ import cors from "cors";
 import { nanoid } from "nanoid";
 import { createClient } from '@supabase/supabase-js';
 
-const supabase = createClient(
-  "https://wrkrtpgfzebcmbjreyra.supabase.co",
-  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Indya3J0cGdmemViY21ianJleXJhIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Njc3NzMzNDcsImV4cCI6MjA4MzM0OTM0N30.67y2ZZmtMPQugtAHj3fniFj1wgcy3hOjcG5xg3yEEj0"
-);
+// 🔥 PRODUCTION: Environment Variables (Render ready!)
+const supabaseUrl = process.env.SUPABASE_URL || "https://wrkrtpgfzebcmbjreyra.supabase.co";
+const supabaseKey = process.env.SUPABASE_ANON_KEY || "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Indya3J0cGdmemViY21ianJleXJhIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Njc3NzMzNDcsImV4cCI6MjA4MzM0OTM0N30.67y2ZZmtMPQugtAHj3fniFj1wgcy3hOjcG5xg3yEEj0";
+
+const supabase = createClient(supabaseUrl, supabaseKey);
 
 const app = express();
-app.use(cors({ origin: true, credentials: true, methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"] }));
+
+// 🔥 PRODUCTION CORS: Multiple origins allowed
+const allowedOrigins = [
+  "https://bgmi-esports-app.onrender.com",  // Frontend Render
+  "http://localhost:3000",                   // Local dev
+  "https://bgmi-esports-app.vercel.app",    // Vercel (future)
+  "https://your-domain.com"                 // Custom domain
+];
+
+app.use(cors({
+  origin: (origin, callback) => {
+    // Allow requests with no origin (mobile apps, Postman, etc.)
+    if (!origin) return callback(null, true);
+    
+    if (allowedOrigins.includes(origin)) {
+      return callback(null, true);
+    } else {
+      console.log("🚫 Blocked origin:", origin);
+      return callback(new Error("Not allowed by CORS"));
+    }
+  },
+  credentials: true,
+  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"]
+}));
+
+app.options("*", cors()); // Pre-flight requests
 app.use(express.json());
 
 let userCounter = 8523;
@@ -37,7 +64,7 @@ const initCounter = async () => {
   }
 };
 
-// 🔥 REGISTER (FIXED SYNTAX!)
+// 🔥 REGISTER (Production Ready)
 app.post("/api/register", async (req, res) => {
   try {
     const { email, username, password, uid } = req.body;
@@ -60,13 +87,12 @@ app.post("/api/register", async (req, res) => {
       return res.status(400).json({ error: "Email already registered" });
     }
 
-    // Generate UNIQUE profile_id (FIXED!)
+    // Generate UNIQUE profile_id
     let profile_id;
     let attempts = 0;
     while (attempts < 100) {
       profile_id = `BGMI-${(userCounter++).toString().padStart(4, '0')}`;
       
-      // 🔥 FIXED: let declare kiya!
       let existingProfile = null;
       const { data: profileCheck } = await supabase
         .from("registeruser")
@@ -76,7 +102,7 @@ app.post("/api/register", async (req, res) => {
       
       existingProfile = profileCheck;
       
-      if (!existingProfile) break; // Unique mil gaya!
+      if (!existingProfile) break;
       attempts++;
     }
 
@@ -121,6 +147,7 @@ app.post("/api/register", async (req, res) => {
   }
 });
 
+// LOGIN
 app.post("/api/login", async (req, res) => {
   try {
     const { email } = req.body;
@@ -139,6 +166,7 @@ app.post("/api/login", async (req, res) => {
   }
 });
 
+// ADMIN USERS
 app.get("/api/admin/users", async (req, res) => {
   try {
     const { data, error } = await supabase
@@ -146,16 +174,23 @@ app.get("/api/admin/users", async (req, res) => {
       .select("*")
       .order("id", { ascending: false });
     if (error) return res.status(500).json({ users: [] });
+    console.log("🟢 Admin users:", data?.length || 0);
     res.json({ users: data || [] });
   } catch (err) {
     res.status(500).json({ users: [] });
   }
 });
 
+// Health check endpoint
+app.get("/health", (req, res) => {
+  res.json({ status: "OK", timestamp: new Date().toISOString() });
+});
+
 const PORT = process.env.PORT || 5001;
 initCounter().then(() => {
   app.listen(PORT, "0.0.0.0", () => {
-    console.log(`🔥 BGMI Server on ${PORT}`);
-    console.log("✅ Ready with unique ID counter!");
+    console.log(`🔥 BGMI Server on port ${PORT}`);
+    console.log("✅ Supabase connected - Production Ready!");
+    console.log("✅ CORS enabled for:", allowedOrigins.join(", "));
   });
 });
