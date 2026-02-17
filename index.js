@@ -12,16 +12,38 @@ const app = express();
 
 // 🔥 ADMIN PANEL + REGISTER = 100% CORS FIXED
 app.use(cors({
-  origin: true,  // ✅ ALL ORIGINS ALLOWED (Register + Admin dono chalega!)
+  origin: true,  // ✅ ALL ORIGINS ALLOWED (Register + Admin + Wallet dono chalega!)
   credentials: true,
   methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization"]
-}));
-
-app.options("*", cors()); 
+})); 
 app.use(express.json());
 
 let userCounter = 8523;
+
+// 🔥 MY BALANCE ENDPOINT (Wallet.jsx ke liye!)
+app.get("/api/my-balance", async (req, res) => {
+  try {
+    const { profileId } = req.query;
+    if (!profileId) {
+      console.log("❌ No profileId provided for balance");
+      return res.json({ balance: 0 });
+    }
+    
+    const { data } = await supabase
+      .from("registeruser")
+      .select("balance")
+      .eq("profile_id", profileId)
+      .single();
+    
+    const balance = data?.balance || 0;
+    console.log("💰 BALANCE FETCH:", profileId, "→ ₹", balance);
+    res.json({ balance });
+  } catch (err) {
+    console.error("❌ BALANCE ERROR:", err);
+    res.json({ balance: 0 });
+  }
+});
 
 // Initialize counter from DB
 const initCounter = async () => {
@@ -194,16 +216,22 @@ app.delete("/api/admin/users/:id", async (req, res) => {
 
 // Health check endpoint
 app.get("/health", (req, res) => {
-  res.json({ status: "OK", timestamp: new Date().toISOString() });
+  res.json({ 
+    status: "OK", 
+    timestamp: new Date().toISOString(),
+    myBalance: "✅ ACTIVE",
+    port: 5001 
+  });
 });
 
 const PORT = process.env.PORT || 5001;
 initCounter().then(() => {
   app.listen(PORT, "0.0.0.0", () => {
-    console.log(`🔥 BGMI Server running on port ${PORT}`);
+    console.log(`🔥 BGMI USER SERVER (5001) running on port ${PORT}`);
     console.log("✅ Supabase connected - Production Ready!");
     console.log("✅ CORS: ALL ORIGINS ALLOWED ✅");
+    console.log("✅ MY-BALANCE ENDPOINT → ACTIVE! 💰");
     console.log("✅ Admin Panel: /api/admin/users ✅");
-    console.log("✅ Test: https://main-server-firebase.onrender.com/health");
+    console.log("✅ Test: http://localhost:${PORT}/health");
   });
 });
