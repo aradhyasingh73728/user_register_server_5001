@@ -7,6 +7,7 @@ import multer from "multer";
 import path from "node:path";
 import { createClient } from "@supabase/supabase-js";
 import { randomInt } from "node:crypto";
+import nodemailer from "nodemailer";
 
 // ==========================================
 // ENVIRONMENT VARIABLES
@@ -23,14 +24,26 @@ if (!supabaseKey) {
   process.exit(1);
 }
 
-const brevoApiKey = process.env.BREVO_API_KEY;
-const brevoSenderEmail = process.env.BREVO_SENDER_EMAIL;
-const brevoSenderName = process.env.BREVO_SENDER_NAME || "BGMI Esports";
+// ==========================================
+// GMAIL SMTP CONFIGURATION
+// ==========================================
 
-if (!brevoApiKey || !brevoSenderEmail) {
-  console.error("❌ Brevo configuration missing in .env");
+const gmailUser = process.env.GMAIL_USER;
+const gmailAppPassword = process.env.GMAIL_APP_PASSWORD;
+
+if (!gmailUser || !gmailAppPassword) {
+  console.error("❌ GMAIL_USER or GMAIL_APP_PASSWORD missing in .env");
   process.exit(1);
 }
+
+const gmailTransporter = nodemailer.createTransport({
+  service: "gmail",
+  auth: {
+    user: gmailUser,
+    pass: gmailAppPassword,
+  },
+});
+
 
 const supabase = createClient(supabaseUrl, supabaseKey);
 
@@ -221,180 +234,134 @@ const generateOTP = () => {
   return randomInt(100000, 1000000).toString();
 };
 
+
 // ==========================================
-// SEND REGISTRATION OTP WITH BREVO
+// GMAIL SMTP EMAIL SENDER
 // ==========================================
 
-const sendOTPEmail = async ({ email, username, otp }) => {
-  const response = await fetch("https://api.brevo.com/v3/smtp/email", {
-    method: "POST",
-    headers: {
-      accept: "application/json",
-      "api-key": brevoApiKey,
-      "content-type": "application/json",
-    },
-    body: JSON.stringify({
-      sender: {
-        name: brevoSenderName,
-        email: brevoSenderEmail,
-      },
-      to: [
-        {
-          email,
-          name: username,
-        },
-      ],
-      subject: "BGMI Esports - Email Verification OTP",
-      htmlContent: `
-        <div style="font-family:Arial,sans-serif;max-width:500px;margin:auto;padding:20px;">
-          <h2>BGMI Esports Email Verification</h2>
+const sendGmailEmail = async ({
+  email,
+  username,
+  otp,
+  subject,
+  heading,
+  message,
+}) => {
 
-          <p>Hello <strong>${username}</strong>,</p>
+  // Username HTML escaping
+  const safeUsername = String(username || "Player")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
 
-          <p>Your email verification OTP is:</p>
+  const mailOptions = {
+    from: `"BGMI Esports" <${gmailUser}>`,
+    to: email,
+    subject,
 
-          <div style="
-            font-size:32px;
-            font-weight:bold;
-            letter-spacing:8px;
-            padding:15px;
-            text-align:center;
-            background:#f3f3f3;
-            margin:20px 0;
-          ">
-            ${otp}
-          </div>
+    html: `
+      <div style="font-family:Arial,sans-serif;max-width:500px;margin:auto;padding:20px;">
 
-          <p>This OTP is valid for <strong>10 minutes</strong>.</p>
+        <h2>${heading}</h2>
 
-          <p>Do not share this OTP with anyone.</p>
+        <p>Hello <strong>${safeUsername}</strong>,</p>
 
-          <p>
-            Regards,<br>
-            <strong>BGMI Esports</strong>
-          </p>
+        <p>${message}</p>
+
+        <div style="
+          font-size:32px;
+          font-weight:bold;
+          letter-spacing:8px;
+          padding:15px;
+          text-align:center;
+          background:#f3f3f3;
+          margin:20px 0;
+        ">
+          ${otp}
         </div>
-      `,
-      textContent: `
-BGMI Esports Email Verification
 
-Hello ${username},
+        <p>This OTP is valid for <strong>10 minutes</strong>.</p>
 
-Your email verification OTP is: ${otp}
+        <p>Do not share this OTP with anyone.</p>
+
+        <p>
+          Regards,<br>
+          <strong>BGMI Esports</strong>
+        </p>
+
+      </div>
+    `,
+
+    text: `
+BGMI Esports
+
+Hello ${username || "Player"},
+
+${message}
+
+Your OTP is: ${otp}
 
 This OTP is valid for 10 minutes.
-
 Do not share this OTP with anyone.
 
 Regards,
 BGMI Esports
-      `,
-    }),
-  });
+    `,
+  };
 
-  if (!response.ok) {
-    const errorText = await response.text();
+  const result = await gmailTransporter.sendMail(mailOptions);
 
-    console.error("❌ BREVO ERROR:", errorText);
-
-    throw new Error("Unable to send verification email");
-  }
-
-  const result = await response.json();
-
-  console.log("✅ OTP EMAIL SENT:", result?.messageId);
+  console.log("✅ GMAIL EMAIL SENT:", result.messageId);
 
   return result;
 };
 
+
 // ==========================================
-// SEND PASSWORD RESET OTP WITH BREVO
+// SEND REGISTRATION OTP WITH GMAIL
+// ==========================================
+
+const sendOTPEmail = async ({ email, username, otp }) => {
+
+  return sendGmailEmail({
+    email,
+    username,
+    otp,
+
+    subject: "BGMI Esports - Email Verification OTP",
+
+    heading: "BGMI Esports Email Verification",
+
+    message: "Your email verification OTP is:",
+  });
+
+};
+
+
+// ==========================================
+// SEND PASSWORD RESET OTP WITH GMAIL
 // ==========================================
 
 const sendPasswordResetEmail = async ({ email, username, otp }) => {
-  const response = await fetch("https://api.brevo.com/v3/smtp/email", {
-    method: "POST",
-    headers: {
-      accept: "application/json",
-      "api-key": brevoApiKey,
-      "content-type": "application/json",
-    },
-    body: JSON.stringify({
-      sender: {
-        name: brevoSenderName,
-        email: brevoSenderEmail,
-      },
-      to: [
-        {
-          email,
-          name: username,
-        },
-      ],
-      subject: "BGMI Esports - Password Reset OTP",
-      htmlContent: `
-        <div style="font-family:Arial,sans-serif;max-width:500px;margin:auto;padding:20px;">
-          <h2>BGMI Esports Password Reset</h2>
 
-          <p>Hello <strong>${username}</strong>,</p>
+  return sendGmailEmail({
+    email,
+    username,
+    otp,
 
-          <p>Your password reset OTP is:</p>
+    subject: "BGMI Esports - Password Reset OTP",
 
-          <div style="
-            font-size:32px;
-            font-weight:bold;
-            letter-spacing:8px;
-            padding:15px;
-            text-align:center;
-            background:#f3f3f3;
-            margin:20px 0;
-          ">
-            ${otp}
-          </div>
+    heading: "BGMI Esports Password Reset",
 
-          <p>This OTP is valid for <strong>10 minutes</strong>.</p>
-
-          <p>
-            If you did not request a password reset,
-            please ignore this email.
-          </p>
-
-          <p>
-            Regards,<br>
-            <strong>BGMI Esports</strong>
-          </p>
-        </div>
-      `,
-      textContent: `
-BGMI Esports Password Reset
-
-Hello ${username},
-
-Your password reset OTP is: ${otp}
-
-This OTP is valid for 10 minutes.
-
-If you did not request a password reset, please ignore this email.
-
-Regards,
-BGMI Esports
-      `,
-    }),
+    message: "Your password reset OTP is:",
   });
 
-  if (!response.ok) {
-    const errorText = await response.text();
-
-    console.error("❌ BREVO RESET EMAIL ERROR:", errorText);
-
-    throw new Error("Unable to send password reset email");
-  }
-
-  const result = await response.json();
-
-  console.log("✅ PASSWORD RESET EMAIL SENT:", result?.messageId);
-
-  return result;
 };
+
+
+
 
 // ==========================================
 // MY BALANCE
@@ -521,7 +488,7 @@ app.post("/api/register", async (req, res) => {
       if (!existingUser.verified) {
         return res.status(400).json({
           error:
-            "Email registered but not verified. Please use Resend OTP.",
+            "Email registered but not verified. Please request a new OTP.",
         });
       }
 
@@ -1436,7 +1403,7 @@ initCounter().then(() => {
     console.log("✅ MY-BALANCE endpoint active");
     console.log("✅ OTP verification active");
     console.log("✅ Password reset endpoints active");
-    console.log("✅ Brevo email service configured");
+    console.log("✅ Gmail SMTP email service configured");
     console.log("✅ Admin users endpoint active");
     console.log("✅ Profile picture upload active");
 
