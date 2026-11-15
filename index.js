@@ -7,7 +7,6 @@ import multer from "multer";
 import path from "node:path";
 import { createClient } from "@supabase/supabase-js";
 import { randomInt } from "node:crypto";
-import nodemailer from "nodemailer";
 
 // ==========================================
 // ENVIRONMENT VARIABLES
@@ -25,25 +24,21 @@ if (!supabaseKey) {
 }
 
 // ==========================================
-// GMAIL SMTP CONFIGURATION
+// MAILJET API CONFIGURATION
 // ==========================================
 
-const gmailUser = process.env.GMAIL_USER;
-const gmailAppPassword = process.env.GMAIL_APP_PASSWORD;
+const MAILJET_API_KEY = process.env.MAILJET_API_KEY;
+const MAILJET_SECRET_KEY = process.env.MAILJET_SECRET_KEY;
+const MAILJET_SENDER_EMAIL = process.env.MAILJET_SENDER_EMAIL;
 
-if (!gmailUser || !gmailAppPassword) {
-  console.error("❌ GMAIL_USER or GMAIL_APP_PASSWORD missing in .env");
+if (
+  !MAILJET_API_KEY ||
+  !MAILJET_SECRET_KEY ||
+  !MAILJET_SENDER_EMAIL
+) {
+  console.error("❌ Mailjet environment variables missing");
   process.exit(1);
 }
-
-const gmailTransporter = nodemailer.createTransport({
-  service: "gmail",
-  auth: {
-    user: gmailUser,
-    pass: gmailAppPassword,
-  },
-});
-
 
 const supabase = createClient(supabaseUrl, supabaseKey);
 
@@ -235,88 +230,7 @@ const generateOTP = () => {
 };
 
 
-// ==========================================
-// GMAIL SMTP EMAIL SENDER
-// ==========================================
 
-const sendGmailEmail = async ({
-  email,
-  username,
-  otp,
-  subject,
-  heading,
-  message,
-}) => {
-
-  // Username HTML escaping
-  const safeUsername = String(username || "Player")
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#039;");
-
-  const mailOptions = {
-    from: `"BGMI Esports" <${gmailUser}>`,
-    to: email,
-    subject,
-
-    html: `
-      <div style="font-family:Arial,sans-serif;max-width:500px;margin:auto;padding:20px;">
-
-        <h2>${heading}</h2>
-
-        <p>Hello <strong>${safeUsername}</strong>,</p>
-
-        <p>${message}</p>
-
-        <div style="
-          font-size:32px;
-          font-weight:bold;
-          letter-spacing:8px;
-          padding:15px;
-          text-align:center;
-          background:#f3f3f3;
-          margin:20px 0;
-        ">
-          ${otp}
-        </div>
-
-        <p>This OTP is valid for <strong>10 minutes</strong>.</p>
-
-        <p>Do not share this OTP with anyone.</p>
-
-        <p>
-          Regards,<br>
-          <strong>BGMI Esports</strong>
-        </p>
-
-      </div>
-    `,
-
-    text: `
-BGMI Esports
-
-Hello ${username || "Player"},
-
-${message}
-
-Your OTP is: ${otp}
-
-This OTP is valid for 10 minutes.
-Do not share this OTP with anyone.
-
-Regards,
-BGMI Esports
-    `,
-  };
-
-  const result = await gmailTransporter.sendMail(mailOptions);
-
-  console.log("✅ GMAIL EMAIL SENT:", result.messageId);
-
-  return result;
-};
 
 
 // ==========================================
@@ -325,7 +239,7 @@ BGMI Esports
 
 const sendOTPEmail = async ({ email, username, otp }) => {
 
-  return sendGmailEmail({
+  return sendMailjetEmail({
     email,
     username,
     otp,
@@ -340,13 +254,106 @@ const sendOTPEmail = async ({ email, username, otp }) => {
 };
 
 
+const sendMailjetEmail = async ({
+  email,
+  username,
+  otp,
+  subject,
+  heading,
+  message,
+}) => {
+
+  const safeUsername = String(username || "Player")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
+
+  const html = `
+    <div style="font-family:Arial,sans-serif;max-width:500px;margin:auto;padding:20px;">
+      <h2>${heading}</h2>
+      <p>Hello <strong>${safeUsername}</strong>,</p>
+      <p>${message}</p>
+      <div style="font-size:32px;font-weight:bold;letter-spacing:8px;padding:15px;text-align:center;background:#f3f3f3;margin:20px 0;">
+        ${otp}
+      </div>
+      <p>This OTP is valid for <strong>10 minutes</strong>.</p>
+      <p>Do not share this OTP with anyone.</p>
+      <p>Regards,<br><strong>BGMI Esports</strong></p>
+    </div>
+  `;
+
+  const text = `
+BGMI Esports
+
+Hello ${username || "Player"},
+
+${message}
+
+Your OTP is: ${otp}
+
+This OTP is valid for 10 minutes.
+Do not share this OTP with anyone.
+
+Regards,
+BGMI Esports
+  `;
+
+  const auth = Buffer.from(
+    `${MAILJET_API_KEY}:${MAILJET_SECRET_KEY}`
+  ).toString("base64");
+
+  const response = await fetch("https://api.mailjet.com/v3.1/send", {
+    method: "POST",
+    headers: {
+      Authorization: `Basic ${auth}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      Messages: [
+        {
+          From: {
+            Email: MAILJET_SENDER_EMAIL,
+            Name: "BGMI Esports",
+          },
+          To: [
+            {
+              Email: email,
+              Name: safeUsername,
+            },
+          ],
+          Subject: subject,
+          TextPart: text,
+          HTMLPart: html,
+        },
+      ],
+    }),
+  });
+
+  const result = await response.json();
+
+  if (!response.ok) {
+    console.error("❌ MAILJET API ERROR:", result);
+    throw new Error(
+      result?.Messages?.[0]?.Errors?.[0]?.ErrorMessage ||
+      `Mailjet request failed: ${response.status}`
+    );
+  }
+
+  console.log("✅ MAILJET EMAIL SENT:", email);
+
+  return result;
+};
+
+
 // ==========================================
 // SEND PASSWORD RESET OTP WITH GMAIL
 // ==========================================
 
 const sendPasswordResetEmail = async ({ email, username, otp }) => {
 
-  return sendGmailEmail({
+  return sendMailjetEmail({
     email,
     username,
     otp,
@@ -1403,7 +1410,7 @@ initCounter().then(() => {
     console.log("✅ MY-BALANCE endpoint active");
     console.log("✅ OTP verification active");
     console.log("✅ Password reset endpoints active");
-    console.log("✅ Gmail SMTP email service configured");
+   console.log("✅ Mailjet API email service configured");
     console.log("✅ Admin users endpoint active");
     console.log("✅ Profile picture upload active");
 
