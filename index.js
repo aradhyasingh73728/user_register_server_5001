@@ -16,10 +16,10 @@ const supabaseUrl =
   process.env.SUPABASE_URL ||
   "https://ltnhgjgoxqxztfsqahce.supabase.co";
 
-const supabaseKey = process.env.SUPABASE_ANON_KEY;
+const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
 if (!supabaseKey) {
-  console.error("❌ SUPABASE_ANON_KEY missing in .env");
+  console.error("❌ SUPABASE_SERVICE_ROLE_KEY missing in environment");
   process.exit(1);
 }
 
@@ -31,11 +31,7 @@ const MAILJET_API_KEY = process.env.MAILJET_API_KEY;
 const MAILJET_SECRET_KEY = process.env.MAILJET_SECRET_KEY;
 const MAILJET_SENDER_EMAIL = process.env.MAILJET_SENDER_EMAIL;
 
-if (
-  !MAILJET_API_KEY ||
-  !MAILJET_SECRET_KEY ||
-  !MAILJET_SENDER_EMAIL
-) {
+if (!MAILJET_API_KEY || !MAILJET_SECRET_KEY || !MAILJET_SENDER_EMAIL) {
   console.error("❌ Mailjet environment variables missing");
   process.exit(1);
 }
@@ -43,10 +39,10 @@ if (
 const supabase = createClient(supabaseUrl, supabaseKey);
 
 const app = express();
-
+app.set("trust proxy", 1);
 
 // ==========================================
-// PLAYER JWT AUTHENTICATION
+// PLAYER JWT + ACCOUNT SECURITY
 // ==========================================
 
 const SUPPORT_JWT_SECRET = process.env.SUPPORT_JWT_SECRET;
@@ -62,6 +58,7 @@ const generatePlayerToken = (user) => {
       role: "player",
       profile_id: user.profile_id,
       email: user.email,
+      token_version: Number(user.token_version || 0),
     },
     SUPPORT_JWT_SECRET,
     {
@@ -74,10 +71,275 @@ const generatePlayerToken = (user) => {
 };
 
 // ==========================================
-// PLAYER AUTH MIDDLEWARE (verifies Bearer token)
+// ORIGINAL DEVICE INSTALLATION ID
 // ==========================================
 
-const requirePlayer = (req, res, next) => {
+const getDeviceInfo = (req) => {
+  const body = req.body || {};
+
+  const cleanText = (value, maxLength = 250) => {
+    if (typeof value !== "string") {
+      return null;
+    }
+
+    const cleaned = value.trim();
+
+    if (!cleaned) {
+      return null;
+    }
+
+    return cleaned.slice(0, maxLength);
+  };
+
+  const cleanNumber = (value) => {
+    const number = Number(value);
+
+    if (!Number.isInteger(number) || number < 0 || number > 10000) {
+      return null;
+    }
+
+    return number;
+  };
+
+  const installationId = cleanText(body.installationId, 200);
+
+  const validInstallationId =
+    installationId && installationId.length >= 16
+      ? installationId
+      : null;
+
+  return {
+    installationId: validInstallationId,
+
+    deviceName: cleanText(body.deviceName, 100) || "Unknown device",
+
+    operatingSystem: cleanText(body.operatingSystem, 100),
+
+    osVersion: cleanText(body.osVersion, 100),
+
+    browserName: cleanText(body.browserName, 100) || "Unknown browser",
+
+    browserVersion: cleanText(body.browserVersion, 100),
+
+    deviceType: cleanText(body.deviceType, 50),
+
+    screenWidth: cleanNumber(body.screenWidth),
+
+    screenHeight: cleanNumber(body.screenHeight),
+
+    language: cleanText(body.language, 50),
+
+    timezone: cleanText(body.timezone, 100),
+
+    platform: cleanText(body.platform, 100),
+
+    // Browser ka actual User-Agent request header se milega.
+    userAgent: cleanText(req.get("user-agent"), 1000),
+
+    // IP backend request se lega, frontend se nahi.
+    ip: req.ip || null,
+  };
+};
+
+// ==========================================
+// CHECK BANNED DEVICE (raw installation_id only)
+// ==========================================
+
+const checkBannedDevice = async (installationId) => {
+  if (
+    typeof installationId !== "string" ||
+    installationId.length < 16 ||
+    installationId.length > 200
+  ) {
+    throw new Error("Valid installation ID is required");
+  }
+
+  const { data: bans, error } = await supabase
+    .from("banned_devices")
+    .select("id, reason, is_permanent, expires_at")
+    .eq("installation_id", installationId);
+
+  if (error) {
+    throw new Error(`Device ban check failed: ${error.message}`);
+  }
+
+  const now = Date.now();
+
+  for (const ban of bans || []) {
+    const expired =
+      ban.is_permanent === false &&
+      ban.expires_at &&
+      new Date(ban.expires_at).getTime() <= now;
+
+    if (expired) {
+      const { error: deleteError } = await supabase
+        .from("banned_devices")
+        .delete()
+        .eq("id", ban.id);
+
+      if (deleteError) {
+        throw new Error(
+          `Expired device ban cleanup failed: ${deleteError.message}`
+        );
+      }
+
+      continue;
+    }
+
+    return {
+      blocked: true,
+      reason: ban.reason || "This device is restricted",
+    };
+  }
+
+  return { blocked: false };
+};
+
+// ==========================================
+// SAVE USER DEVICE (raw installation_id, no hash)
+// ==========================================
+
+const saveUserDevice = async (deviceInfo, profileId) => {
+  if (
+    !deviceInfo ||
+    typeof deviceInfo.installationId !== "string" ||
+    deviceInfo.installationId.length < 16
+  ) {
+    throw new Error("Valid installation ID is required for device history");
+  }
+
+  const { data: existing, error: findError } = await supabase
+    .from("user_devices")
+    .select("id")
+    .eq("profile_id", profileId)
+    .eq("installation_id", deviceInfo.installationId)
+    .maybeSingle();
+
+  if (findError) {
+    throw new Error(`Device history lookup failed: ${findError.message}`);
+  }
+
+  const now = new Date().toISOString();
+
+  const deviceRecord = {
+    profile_id: profileId,
+    installation_id: deviceInfo.installationId,
+
+    device_name: deviceInfo.deviceName,
+    browser_name: deviceInfo.browserName,
+    last_ip: deviceInfo.ip,
+
+    operating_system: deviceInfo.operatingSystem,
+    os_version: deviceInfo.osVersion,
+    browser_version: deviceInfo.browserVersion,
+    device_type: deviceInfo.deviceType,
+    screen_width: deviceInfo.screenWidth,
+    screen_height: deviceInfo.screenHeight,
+    language: deviceInfo.language,
+    timezone: deviceInfo.timezone,
+    platform: deviceInfo.platform,
+    user_agent: deviceInfo.userAgent,
+
+    last_seen: now,
+  };
+
+  if (existing) {
+    const { error } = await supabase
+      .from("user_devices")
+      .update(deviceRecord)
+      .eq("id", existing.id);
+
+    if (error) {
+      throw new Error(`Device history update failed: ${error.message}`);
+    }
+
+    console.log("USER DEVICE UPDATED:", profileId);
+  } else {
+    const { error } = await supabase
+      .from("user_devices")
+      .insert({
+        ...deviceRecord,
+        first_seen: now,
+      });
+
+    if (error) {
+      throw new Error(`Device history insert failed: ${error.message}`);
+    }
+
+    console.log("USER DEVICE SAVED:", profileId);
+  }
+
+  console.log("RAW INSTALLATION ID SAVED:", deviceInfo.installationId);
+};
+
+// ==========================================
+// ACCOUNT STATUS CHECK + AUTO REACTIVATION
+// ==========================================
+
+const checkAccountStatus = async (user) => {
+  let currentUser = user;
+
+  const status = currentUser.account_status || "active";
+
+  if (status === "banned") {
+    return {
+      allowed: false,
+      message: "Your account has been permanently banned.",
+      user: currentUser,
+    };
+  }
+
+  if (status === "suspended") {
+    const expiry = currentUser.suspended_until
+      ? new Date(currentUser.suspended_until).getTime()
+      : null;
+
+    // No expiry = indefinite suspension.
+    if (!expiry || expiry > Date.now()) {
+      return {
+        allowed: false,
+        message: "Your account is suspended.",
+        user: currentUser,
+      };
+    }
+
+    // Suspension expire ho chuki hai: account active karo.
+    const newTokenVersion = Number(currentUser.token_version || 0) + 1;
+
+    const { data: reactivatedUser, error } = await supabase
+      .from("registeruser")
+      .update({
+        account_status: "active",
+        suspended_until: null,
+        suspension_reason: null,
+        token_version: newTokenVersion,
+      })
+      .eq("profile_id", currentUser.profile_id)
+      .select("*")
+      .single();
+
+    if (error || !reactivatedUser) {
+      throw new Error(
+        `Account reactivation failed: ${error?.message || "Unknown error"}`
+      );
+    }
+
+    currentUser = reactivatedUser;
+  }
+
+  return {
+    allowed: true,
+    message: "Account active",
+    user: currentUser,
+  };
+};
+
+// ==========================================
+// PLAYER AUTH MIDDLEWARE
+// Every protected request checks DB status.
+// ==========================================
+
+const requirePlayer = async (req, res, next) => {
   try {
     const authHeader = req.headers.authorization || "";
     const token = authHeader.startsWith("Bearer ")
@@ -97,19 +359,76 @@ const requirePlayer = (req, res, next) => {
       algorithms: ["HS256"],
     });
 
-    if (decoded.role !== "player") {
+    if (decoded.role !== "player" || !decoded.profile_id) {
       return res.status(403).json({
         success: false,
         message: "Not allowed",
       });
     }
 
-    req.player = decoded;
+    const { data: user, error } = await supabase
+      .from("registeruser")
+      .select(
+        "id, profile_id, email, account_status, suspended_until, suspension_reason, token_version"
+      )
+      .eq("profile_id", decoded.profile_id)
+      .eq("email", decoded.email)
+      .maybeSingle();
+
+    if (error) {
+      console.error("❌ PLAYER SECURITY CHECK:", error.message);
+
+      return res.status(500).json({
+        success: false,
+        message: "Could not verify account security",
+      });
+    }
+
+    if (!user) {
+      return res.status(401).json({
+        success: false,
+        message: "Account not found. Please login again.",
+      });
+    }
+
+    const statusCheck = await checkAccountStatus(user);
+
+    if (!statusCheck.allowed) {
+      return res.status(403).json({
+        success: false,
+        message: statusCheck.message,
+        account_status: statusCheck.user.account_status,
+        suspended_until: statusCheck.user.suspended_until,
+      });
+    }
+
+    const latestUser = statusCheck.user;
+
+    // Suspension/ban/unsuspend ke baad old tokens reject honge.
+    if (
+      Number(decoded.token_version || 0) !==
+      Number(latestUser.token_version || 0)
+    ) {
+      return res.status(401).json({
+        success: false,
+        message: "Your session has been revoked. Please login again.",
+      });
+    }
+
+    req.player = {
+      role: "player",
+      profile_id: latestUser.profile_id,
+      email: latestUser.email,
+      token_version: latestUser.token_version || 0,
+    };
+
     next();
   } catch (err) {
+    console.error("❌ PLAYER AUTH ERROR:", err.message);
+
     return res.status(401).json({
       success: false,
-      message: "Session expired. Please login again.",
+      message: "Session expired or invalid. Please login again.",
     });
   }
 };
@@ -121,7 +440,7 @@ const requirePlayer = (req, res, next) => {
 const AVATAR_BUCKET = "BGMI";
 const MAX_AVATAR_SIZE = 2 * 1024 * 1024; // 2MB
 
-// public/avatars/avatar1.png ... avatar12.png
+// public/avatars/avatar1.svg ... avatar12.svg
 const DEFAULT_AVATAR_REGEX = /^\/avatars\/avatar([1-9]|1[0-2])\.svg$/;
 
 const ALLOWED_IMAGE_TYPES = [
@@ -162,8 +481,6 @@ const handleAvatarUpload = (req, res, next) => {
   });
 };
 
-
-
 // ==========================================
 // MIDDLEWARE
 // ==========================================
@@ -180,6 +497,98 @@ app.use(
 app.use(express.json());
 
 // ==========================================
+// ADMIN JWT AUTHENTICATION
+// WITH INDIVIDUAL SESSION VALIDATION
+// ==========================================
+
+const ADMIN_JWT_SECRET = process.env.JWT_SECRET;
+
+if (!ADMIN_JWT_SECRET || ADMIN_JWT_SECRET.length < 32) {
+  console.error("JWT_SECRET missing or too short");
+  process.exit(1);
+}
+
+const requireAdmin = async (req, res, next) => {
+  try {
+    const authHeader = req.headers.authorization || "";
+
+    const token = authHeader.startsWith("Bearer ")
+      ? authHeader.slice(7)
+      : null;
+
+    if (!token) {
+      return res.status(401).json({
+        success: false,
+        message: "Admin login required",
+      });
+    }
+
+    // STEP 1: Verify JWT
+    const decoded = jwt.verify(token, ADMIN_JWT_SECRET);
+
+    if (decoded.role !== "admin") {
+      return res.status(403).json({
+        success: false,
+        message: "Admin access only",
+      });
+    }
+
+    // STEP 2: Check Session ID
+    if (!decoded.sid) {
+      return res.status(401).json({
+        success: false,
+        message: "Session ID missing. Please login again.",
+      });
+    }
+
+    // STEP 3: Check session in Supabase
+    const { data: session, error } = await supabase
+      .from("admin_sessions")
+      .select("id, admin_id, is_revoked")
+      .eq("id", decoded.sid)
+      .maybeSingle();
+
+    if (error) {
+      console.error("ADMIN SESSION CHECK ERROR:", error.message);
+
+      return res.status(500).json({
+        success: false,
+        message: "Could not verify admin session",
+      });
+    }
+
+    // STEP 4: Session must exist
+    if (!session) {
+      return res.status(401).json({
+        success: false,
+        message: "Admin session not found. Please login again.",
+      });
+    }
+
+    // STEP 5: Reject revoked session
+    if (session.is_revoked === true) {
+      return res.status(401).json({
+        success: false,
+        message: "Your session has been revoked. Please login again.",
+        code: "SESSION_REVOKED",
+      });
+    }
+
+    // STEP 6: Allow request
+    req.admin = decoded;
+
+    next();
+  } catch (err) {
+    console.error("ADMIN AUTH ERROR:", err.message);
+
+    return res.status(401).json({
+      success: false,
+      message: "Invalid or expired admin session",
+    });
+  }
+};
+
+// ==========================================
 // USER COUNTER
 // ==========================================
 
@@ -187,39 +596,17 @@ let userCounter = 8523;
 
 // ==========================================
 // REGISTRATION OTP STORAGE
+// email -> { otp, expiresAt, attempts, sentAt, profileId, deviceInfo }
 // ==========================================
 
 const otpStore = new Map();
 
-/*
-otpStore structure:
-
-email -> {
-  otp: "123456",
-  expiresAt: timestamp,
-  attempts: 0,
-  sentAt: timestamp,
-  profileId: "FF-8523"
-}
-*/
-
 // ==========================================
 // PASSWORD RESET OTP STORAGE
+// email -> { otp, expiresAt, attempts, sentAt, profileId }
 // ==========================================
 
 const resetOtpStore = new Map();
-
-/*
-resetOtpStore structure:
-
-email -> {
-  otp: "123456",
-  expiresAt: timestamp,
-  attempts: 0,
-  sentAt: timestamp,
-  profileId: "FF-8523"
-}
-*/
 
 // ==========================================
 // OTP GENERATOR
@@ -229,30 +616,9 @@ const generateOTP = () => {
   return randomInt(100000, 1000000).toString();
 };
 
-
-
-
-
 // ==========================================
-// SEND REGISTRATION OTP WITH GMAIL
+// MAILJET EMAIL SENDER
 // ==========================================
-
-const sendOTPEmail = async ({ email, username, otp }) => {
-
-  return sendMailjetEmail({
-    email,
-    username,
-    otp,
-
-    subject: "BGMI Esports - Email Verification OTP",
-
-    heading: "BGMI Esports Email Verification",
-
-    message: "Your email verification OTP is:",
-  });
-
-};
-
 
 const sendMailjetEmail = async ({
   email,
@@ -262,7 +628,6 @@ const sendMailjetEmail = async ({
   heading,
   message,
 }) => {
-
   const safeUsername = String(username || "Player")
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
@@ -337,7 +702,7 @@ BGMI Esports
     console.error("❌ MAILJET API ERROR:", result);
     throw new Error(
       result?.Messages?.[0]?.Errors?.[0]?.ErrorMessage ||
-      `Mailjet request failed: ${response.status}`
+        `Mailjet request failed: ${response.status}`
     );
   }
 
@@ -346,29 +711,35 @@ BGMI Esports
   return result;
 };
 
-
 // ==========================================
-// SEND PASSWORD RESET OTP WITH GMAIL
+// SEND REGISTRATION OTP
 // ==========================================
 
-const sendPasswordResetEmail = async ({ email, username, otp }) => {
-
+const sendOTPEmail = async ({ email, username, otp }) => {
   return sendMailjetEmail({
     email,
     username,
     otp,
-
-    subject: "BGMI Esports - Password Reset OTP",
-
-    heading: "BGMI Esports Password Reset",
-
-    message: "Your password reset OTP is:",
+    subject: "BGMI Esports - Email Verification OTP",
+    heading: "BGMI Esports Email Verification",
+    message: "Your email verification OTP is:",
   });
-
 };
 
+// ==========================================
+// SEND PASSWORD RESET OTP
+// ==========================================
 
-
+const sendPasswordResetEmail = async ({ email, username, otp }) => {
+  return sendMailjetEmail({
+    email,
+    username,
+    otp,
+    subject: "BGMI Esports - Password Reset OTP",
+    heading: "BGMI Esports Password Reset",
+    message: "Your password reset OTP is:",
+  });
+};
 
 // ==========================================
 // MY BALANCE
@@ -429,10 +800,8 @@ const initCounter = async () => {
         userCounter = parseInt(lastId, 10) + 1;
 
         console.log(
-  `🔄 Counter set to: BGMI-${userCounter
-    .toString()
-    .padStart(4, "0")}`
-);
+          `🔄 Counter set to: BGMI-${userCounter.toString().padStart(4, "0")}`
+        );
 
         return;
       }
@@ -440,10 +809,7 @@ const initCounter = async () => {
 
     console.log("🔄 No existing users, starting from BGMI-8523");
   } catch (err) {
-    console.log(
-      "⚠️ Counter init failed, using default:",
-      userCounter
-    );
+    console.log("⚠️ Counter init failed, using default:", userCounter);
   }
 };
 
@@ -454,6 +820,26 @@ const initCounter = async () => {
 app.post("/api/register", async (req, res) => {
   try {
     const { email, username, password } = req.body;
+
+    // DEVICE RESTRICTION CHECK
+    const deviceInfo = getDeviceInfo(req);
+
+    if (!deviceInfo.installationId) {
+      return res.status(400).json({
+        success: false,
+        error: "Valid installation ID is required.",
+      });
+    }
+
+    const deviceCheck = await checkBannedDevice(deviceInfo.installationId);
+
+    if (deviceCheck.blocked) {
+      return res.status(403).json({
+        success: false,
+        error: "Registration blocked on this device.",
+        message: deviceCheck.reason,
+      });
+    }
 
     console.log("📥 Register attempt:", { email, username });
 
@@ -471,20 +857,14 @@ app.post("/api/register", async (req, res) => {
     // CHECK EXISTING USER
     // --------------------------------------
 
-    const {
-      data: existingUser,
-      error: existingUserError,
-    } = await supabase
+    const { data: existingUser, error: existingUserError } = await supabase
       .from("registeruser")
       .select("id, profile_id, verified")
       .eq("email", cleanEmail)
       .maybeSingle();
 
     if (existingUserError) {
-      console.error(
-        "💥 Existing user check error:",
-        existingUserError.message
-      );
+      console.error("💥 Existing user check error:", existingUserError.message);
 
       return res.status(500).json({
         error: existingUserError.message,
@@ -494,8 +874,7 @@ app.post("/api/register", async (req, res) => {
     if (existingUser) {
       if (!existingUser.verified) {
         return res.status(400).json({
-          error:
-            "Email registered but not verified. Please request a new OTP.",
+          error: "Email registered but not verified. Please request a new OTP.",
         });
       }
 
@@ -512,26 +891,18 @@ app.post("/api/register", async (req, res) => {
     let attempts = 0;
 
     while (attempts < 100) {
-      const generatedId = `BGMI-${userCounter
-  .toString()
-  .padStart(4, "0")}`;
+      const generatedId = `BGMI-${userCounter.toString().padStart(4, "0")}`;
 
       userCounter++;
 
-      const {
-        data: profileCheck,
-        error: profileCheckError,
-      } = await supabase
+      const { data: profileCheck, error: profileCheckError } = await supabase
         .from("registeruser")
         .select("id")
         .eq("profile_id", generatedId)
         .maybeSingle();
 
       if (profileCheckError) {
-        console.error(
-          "💥 Profile check error:",
-          profileCheckError.message
-        );
+        console.error("💥 Profile check error:", profileCheckError.message);
 
         return res.status(500).json({
           error: profileCheckError.message,
@@ -561,22 +932,25 @@ app.post("/api/register", async (req, res) => {
     });
 
     // --------------------------------------
-    // INSERT UNVERIFIED USER
+    // INSERT UNVERIFIED USER (plain password)
     // --------------------------------------
 
-    const { error: supaErr } = await supabase
-      .from("registeruser")
-      .insert([
-        {
-          profile_id,
-          username: cleanUsername,
-          email: cleanEmail,
-          "User Password": cleanPassword,
-          balance: 0,
-          register_time_ist: istTime,
-          verified: false,
-        },
-      ]);
+    const { error: supaErr } = await supabase.from("registeruser").insert([
+      {
+        profile_id,
+        username: cleanUsername,
+        email: cleanEmail,
+        "User Password": cleanPassword,
+        balance: 0,
+        register_time_ist: istTime,
+        verified: false,
+
+        account_status: "active",
+        suspended_until: null,
+        suspension_reason: null,
+        token_version: 0,
+      },
+    ]);
 
     if (supaErr) {
       console.error("💥 Supabase ERROR:", supaErr.message);
@@ -599,6 +973,9 @@ app.post("/api/register", async (req, res) => {
       attempts: 0,
       sentAt: now,
       profileId: profile_id,
+
+      // Registration ke original device ki details OTP ke saath bind
+      deviceInfo,
     });
 
     // --------------------------------------
@@ -612,30 +989,19 @@ app.post("/api/register", async (req, res) => {
         otp,
       });
     } catch (emailError) {
-      console.error(
-        "❌ OTP EMAIL FAILED:",
-        emailError.message
-      );
+      console.error("❌ OTP EMAIL FAILED:", emailError.message);
 
       // Rollback user if email failed
-      await supabase
-        .from("registeruser")
-        .delete()
-        .eq("profile_id", profile_id);
+      await supabase.from("registeruser").delete().eq("profile_id", profile_id);
 
       otpStore.delete(cleanEmail);
 
       return res.status(500).json({
-        error:
-          "Account could not be created because verification email failed.",
+        error: "Account could not be created because verification email failed.",
       });
     }
 
-    console.log(
-      "✅ USER CREATED - OTP SENT:",
-      profile_id,
-      cleanEmail
-    );
+    console.log("✅ USER CREATED - OTP SENT:", profile_id, cleanEmail);
 
     res.json({
       success: true,
@@ -683,6 +1049,42 @@ app.post("/api/verify-otp", async (req, res) => {
       });
     }
 
+    // --------------------------------------
+    // SAME DEVICE VERIFICATION
+    // --------------------------------------
+
+    const currentDeviceInfo = getDeviceInfo(req);
+
+    if (!currentDeviceInfo.installationId) {
+      return res.status(400).json({
+        success: false,
+        error: "Valid installation ID is required.",
+      });
+    }
+
+    if (
+      !stored.deviceInfo ||
+      stored.deviceInfo.installationId !== currentDeviceInfo.installationId
+    ) {
+      return res.status(403).json({
+        success: false,
+        error: "OTP verification must be completed on the registered device.",
+      });
+    }
+
+    // OTP verification se pehle device ban dobara check karo
+    const deviceCheck = await checkBannedDevice(
+      stored.deviceInfo.installationId
+    );
+
+    if (deviceCheck.blocked) {
+      return res.status(403).json({
+        success: false,
+        error: "OTP verification blocked on this device.",
+        message: deviceCheck.reason,
+      });
+    }
+
     if (Date.now() > stored.expiresAt) {
       otpStore.delete(cleanEmail);
 
@@ -695,8 +1097,7 @@ app.post("/api/verify-otp", async (req, res) => {
       otpStore.delete(cleanEmail);
 
       return res.status(429).json({
-        error:
-          "Too many incorrect attempts. Please request a new OTP.",
+        error: "Too many incorrect attempts. Please request a new OTP.",
       });
     }
 
@@ -704,9 +1105,7 @@ app.post("/api/verify-otp", async (req, res) => {
       stored.attempts += 1;
 
       return res.status(400).json({
-        error: `Invalid OTP. Attempts left: ${
-          5 - stored.attempts
-        }`,
+        error: `Invalid OTP. Attempts left: ${5 - stored.attempts}`,
       });
     }
 
@@ -714,45 +1113,53 @@ app.post("/api/verify-otp", async (req, res) => {
     // UPDATE VERIFIED
     // --------------------------------------
 
-    const { data: verifiedUser, error: verifyError } =
-      await supabase
-        .from("registeruser")
-        .update({
-          verified: true,
-        })
-        .eq("email", cleanEmail)
-        .eq("profile_id", stored.profileId)
-        .select("*")
-        .single();
+    const { data: verifiedUser, error: verifyError } = await supabase
+      .from("registeruser")
+      .update({
+        verified: true,
+      })
+      .eq("email", cleanEmail)
+      .eq("profile_id", stored.profileId)
+      .select("*")
+      .single();
 
     if (verifyError || !verifiedUser) {
-      console.error(
-        "❌ VERIFY DB ERROR:",
-        verifyError?.message
-      );
+      console.error("❌ VERIFY DB ERROR:", verifyError?.message);
 
       return res.status(500).json({
         error: "Could not verify account",
       });
     }
 
+    const statusCheck = await checkAccountStatus(verifiedUser);
+
+    if (!statusCheck.allowed) {
+      return res.status(403).json({
+        success: false,
+        error: statusCheck.message,
+      });
+    }
+
+    const finalUser = statusCheck.user;
+
+    // Registration ke original device ki details save hongi
+    await saveUserDevice(stored.deviceInfo, finalUser.profile_id);
+
     otpStore.delete(cleanEmail);
 
-    const user = {
-  ...verifiedUser,
-  token: generatePlayerToken(verifiedUser),
-};
+    const { "User Password": _password, ...safeUser } = finalUser;
 
-    console.log(
-      "✅ EMAIL VERIFIED:",
-      verifiedUser.profile_id,
-      cleanEmail
-    );
+    const responseUser = {
+      ...safeUser,
+      token: generatePlayerToken(finalUser),
+    };
+
+    console.log("✅ EMAIL VERIFIED:", verifiedUser.profile_id, cleanEmail);
 
     res.json({
       success: true,
       message: "Email verified successfully",
-      user,
+      user: responseUser,
     });
   } catch (err) {
     console.error("💥 Verify OTP CRASH:", err);
@@ -808,18 +1215,50 @@ app.post("/api/resend-otp", async (req, res) => {
     }
 
     // --------------------------------------
-    // RESEND LIMIT
+    // ORIGINAL DEVICE BINDING CHECK
     // --------------------------------------
 
     const previous = otpStore.get(cleanEmail);
 
+    const currentDeviceInfo = getDeviceInfo(req);
+
+    if (!currentDeviceInfo.installationId) {
+      return res.status(400).json({
+        success: false,
+        error: "Valid installation ID is required.",
+      });
+    }
+
     if (
-      previous &&
-      Date.now() - previous.sentAt < 60 * 1000
+      !previous ||
+      !previous.deviceInfo ||
+      previous.deviceInfo.installationId !== currentDeviceInfo.installationId
     ) {
+      return res.status(403).json({
+        success: false,
+        error: "OTP resend must be requested from the registered device.",
+      });
+    }
+
+    const deviceCheck = await checkBannedDevice(
+      previous.deviceInfo.installationId
+    );
+
+    if (deviceCheck.blocked) {
+      return res.status(403).json({
+        success: false,
+        error: "OTP resend blocked on this device.",
+        message: deviceCheck.reason,
+      });
+    }
+
+    // --------------------------------------
+    // RESEND LIMIT
+    // --------------------------------------
+
+    if (Date.now() - previous.sentAt < 60 * 1000) {
       return res.status(429).json({
-        error:
-          "Please wait 60 seconds before requesting another OTP.",
+        error: "Please wait 60 seconds before requesting another OTP.",
       });
     }
 
@@ -836,6 +1275,7 @@ app.post("/api/resend-otp", async (req, res) => {
       attempts: 0,
       sentAt: now,
       profileId: user.profile_id,
+      deviceInfo: previous.deviceInfo,
     });
 
     await sendOTPEmail({
@@ -899,10 +1339,7 @@ app.post("/api/forgot-password", async (req, res) => {
 
     const previous = resetOtpStore.get(email);
 
-    if (
-      previous &&
-      Date.now() - previous.sentAt < 60 * 1000
-    ) {
+    if (previous && Date.now() - previous.sentAt < 60 * 1000) {
       return res.status(429).json({
         error: "Please wait 60 seconds before requesting another OTP",
       });
@@ -934,10 +1371,7 @@ app.post("/api/forgot-password", async (req, res) => {
         otp,
       });
     } catch (emailError) {
-      console.error(
-        "❌ PASSWORD RESET EMAIL FAILED:",
-        emailError.message
-      );
+      console.error("❌ PASSWORD RESET EMAIL FAILED:", emailError.message);
 
       resetOtpStore.delete(email);
 
@@ -991,10 +1425,7 @@ app.post("/api/reset-password", async (req, res) => {
       });
     }
 
-    // --------------------------------------
     // OTP EXPIRY
-    // --------------------------------------
-
     if (Date.now() > stored.expiresAt) {
       resetOtpStore.delete(email);
 
@@ -1003,10 +1434,7 @@ app.post("/api/reset-password", async (req, res) => {
       });
     }
 
-    // --------------------------------------
     // MAX ATTEMPTS
-    // --------------------------------------
-
     if (stored.attempts >= 5) {
       resetOtpStore.delete(email);
 
@@ -1015,42 +1443,32 @@ app.post("/api/reset-password", async (req, res) => {
       });
     }
 
-    // --------------------------------------
     // CHECK OTP
-    // --------------------------------------
-
     if (otp !== stored.otp) {
       stored.attempts += 1;
 
       return res.status(400).json({
-        error: `Invalid OTP. Attempts left: ${
-          5 - stored.attempts
-        }`,
+        error: `Invalid OTP. Attempts left: ${5 - stored.attempts}`,
       });
     }
 
     // --------------------------------------
-    // UPDATE PASSWORD
-    // Existing password format remains unchanged
+    // UPDATE PASSWORD (plain, same format)
     // --------------------------------------
 
-    const { data: updatedUser, error: updateError } =
-      await supabase
-        .from("registeruser")
-        .update({
-          "User Password": newPassword,
-        })
-        .eq("email", email)
-        .eq("profile_id", stored.profileId)
-        .eq("verified", true)
-        .select("profile_id")
-        .single();
+    const { data: updatedUser, error: updateError } = await supabase
+      .from("registeruser")
+      .update({
+        "User Password": newPassword,
+      })
+      .eq("email", email)
+      .eq("profile_id", stored.profileId)
+      .eq("verified", true)
+      .select("profile_id")
+      .single();
 
     if (updateError || !updatedUser) {
-      console.error(
-        "❌ RESET PASSWORD DB ERROR:",
-        updateError?.message
-      );
+      console.error("❌ RESET PASSWORD DB ERROR:", updateError?.message);
 
       return res.status(500).json({
         error: "Could not update password",
@@ -1060,10 +1478,7 @@ app.post("/api/reset-password", async (req, res) => {
     // OTP is removed after successful password reset
     resetOtpStore.delete(email);
 
-    console.log(
-      "✅ PASSWORD RESET SUCCESS:",
-      updatedUser.profile_id
-    );
+    console.log("✅ PASSWORD RESET SUCCESS:", updatedUser.profile_id);
 
     return res.json({
       success: true,
@@ -1086,63 +1501,106 @@ app.post("/api/login", async (req, res) => {
   try {
     const { email, password } = req.body;
 
-    if (!email) {
+    if (!email || !password) {
       return res.status(400).json({
-        error: "Email required",
+        success: false,
+        error: "Email and password required",
       });
     }
 
-    if (!password) {
+    // DEVICE BAN CHECK
+    const deviceInfo = getDeviceInfo(req);
+
+    if (!deviceInfo.installationId) {
       return res.status(400).json({
-        error: "Password required",
+        success: false,
+        error: "Valid installation ID is required.",
       });
     }
 
+    const deviceCheck = await checkBannedDevice(deviceInfo.installationId);
+
+    if (deviceCheck.blocked) {
+      return res.status(403).json({
+        success: false,
+        error: "Login blocked on this device.",
+        message: deviceCheck.reason,
+      });
+    }
+
+    // FIND USER
     const { data: user, error } = await supabase
       .from("registeruser")
       .select("*")
       .eq("email", email.toLowerCase().trim())
-      .single();
+      .maybeSingle();
 
-    if (error || !user) {
+    if (error) {
+      console.error("❌ LOGIN DB ERROR:", error.message);
+
+      return res.status(500).json({
+        success: false,
+        error: "Login could not be processed",
+      });
+    }
+
+    if (!user) {
       return res.status(404).json({
+        success: false,
         error: "User not found",
       });
     }
 
-    if (
-      (user["User Password"] || "").trim() !==
-      password.trim()
-    ) {
+    // Plain password compare
+    if ((user["User Password"] || "").trim() !== password.trim()) {
       return res.status(401).json({
+        success: false,
         error: "Invalid password",
       });
     }
 
-    // --------------------------------------
-    // EMAIL VERIFICATION CHECK
-    // --------------------------------------
-
     if (!user.verified) {
       return res.status(403).json({
-        error:
-          "Email not verified. Please verify your email with OTP.",
+        success: false,
+        error: "Email not verified. Please verify your email with OTP.",
         requiresVerification: true,
         email: user.email,
       });
     }
 
-    res.json({
+    // ACCOUNT SUSPENSION / BAN CHECK
+    const statusCheck = await checkAccountStatus(user);
+
+    if (!statusCheck.allowed) {
+      return res.status(403).json({
+        success: false,
+        error: statusCheck.message,
+        account_status: statusCheck.user.account_status,
+        suspended_until: statusCheck.user.suspended_until,
+        suspension_reason: statusCheck.user.suspension_reason,
+      });
+    }
+
+    const activeUser = statusCheck.user;
+
+    // DEVICE HISTORY
+    await saveUserDevice(deviceInfo, activeUser.profile_id);
+
+    // Password response mein kabhi nahi bhejna
+    const { "User Password": _password, ...safeUser } = activeUser;
+
+    return res.json({
       success: true,
       user: {
-        ...user,
-        token: generatePlayerToken(user),
+        ...safeUser,
+        token: generatePlayerToken(activeUser),
       },
     });
   } catch (err) {
     console.error("💥 Login CRASH:", err);
 
-    res.status(500).json({
+    return res.status(500).json({
+      success: false,
       error: "Login failed",
     });
   }
@@ -1206,13 +1664,9 @@ app.post(
       let avatar;
 
       if (req.file) {
-        // --------------------------------------
         // CUSTOM UPLOAD -> Supabase Storage
-        // --------------------------------------
-
         const ext =
-          path.extname(req.file.originalname || "").toLowerCase() ||
-          ".png";
+          path.extname(req.file.originalname || "").toLowerCase() || ".png";
 
         const fileName = `${profile_id}-${Date.now()}${ext}`;
 
@@ -1241,10 +1695,7 @@ app.post(
         typeof avatarUrl === "string" &&
         DEFAULT_AVATAR_REGEX.test(avatarUrl)
       ) {
-        // --------------------------------------
         // DEFAULT GAMING AVATAR (sirf app ke apne)
-        // --------------------------------------
-
         avatar = avatarUrl;
       } else {
         return res.status(400).json({
@@ -1253,10 +1704,7 @@ app.post(
         });
       }
 
-      // --------------------------------------
       // SAVE IN DB
-      // --------------------------------------
-
       const { error: updateError } = await supabase
         .from("registeruser")
         .update({ avatar })
@@ -1293,46 +1741,39 @@ app.post(
 // ADMIN USERS
 // ==========================================
 
-app.get("/api/admin/users", async (req, res) => {
+// GET ALL USERS FOR ADMIN
+app.get("/api/admin/users", requireAdmin, async (req, res) => {
   try {
-    console.log(
-      "🔍 ADMIN /api/admin/users CALLED from IP:",
-      req.ip,
-      "Origin:",
-      req.headers.origin
-    );
-
     const { data, error } = await supabase
       .from("registeruser")
-      .select("*")
+      .select(`
+        id,
+        profile_id,
+        username,
+        email,
+        verified,
+        account_status,
+        suspended_until,
+        suspension_reason,
+        token_version
+      `)
       .order("id", { ascending: false });
 
     if (error) {
-      console.error(
-        "💥 Admin users ERROR:",
-        error.message
-      );
-
       return res.status(500).json({
-        users: [],
-        error: error.message,
+        success: false,
+        message: error.message,
       });
     }
 
-    console.log(
-      "🟢 Admin users:",
-      data?.length || 0,
-      "users sent"
-    );
-
-    res.json({
+    return res.json({
+      success: true,
       users: data || [],
     });
-  } catch (err) {
-    console.error("💥 Admin users CRASH:", err);
-
-    res.status(500).json({
-      users: [],
+  } catch (error) {
+    return res.status(500).json({
+      success: false,
+      message: error.message,
     });
   }
 });
@@ -1341,22 +1782,16 @@ app.get("/api/admin/users", async (req, res) => {
 // DELETE USER
 // ==========================================
 
-app.delete("/api/admin/users/:id", async (req, res) => {
+app.delete("/api/admin/users/:id", requireAdmin, async (req, res) => {
   try {
     const { id } = req.params;
 
     console.log("🗑️ DELETE user:", id);
 
-    const { error } = await supabase
-      .from("registeruser")
-      .delete()
-      .eq("id", id);
+    const { error } = await supabase.from("registeruser").delete().eq("id", id);
 
     if (error) {
-      console.error(
-        "💥 Delete ERROR:",
-        error.message
-      );
+      console.error("💥 Delete ERROR:", error.message);
 
       return res.status(500).json({
         error: error.message,
@@ -1401,21 +1836,17 @@ const PORT = process.env.PORT || 5001;
 
 initCounter().then(() => {
   app.listen(PORT, "0.0.0.0", () => {
-    console.log(
-  `🔥 BGMI USER SERVER (5001) running on port ${PORT}`
-);
+    console.log(`🔥 BGMI USER SERVER (5001) running on port ${PORT}`);
 
     console.log("✅ Supabase connected");
     console.log("✅ CORS active");
     console.log("✅ MY-BALANCE endpoint active");
     console.log("✅ OTP verification active");
     console.log("✅ Password reset endpoints active");
-   console.log("✅ Mailjet API email service configured");
+    console.log("✅ Mailjet API email service configured");
     console.log("✅ Admin users endpoint active");
     console.log("✅ Profile picture upload active");
 
-    console.log(
-      `✅ Test: http://localhost:${PORT}/health`
-    );
+    console.log(`✅ Test: http://localhost:${PORT}/health`);
   });
 });
