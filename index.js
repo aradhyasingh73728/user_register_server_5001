@@ -1,5 +1,5 @@
 import "dotenv/config";
-
+import { OAuth2Client } from "google-auth-library";
 import express from "express";
 import cors from "cors";
 import jwt from "jsonwebtoken";
@@ -37,6 +37,16 @@ if (!MAILJET_API_KEY || !MAILJET_SECRET_KEY || !MAILJET_SENDER_EMAIL) {
 }
 
 const supabase = createClient(supabaseUrl, supabaseKey);
+
+// ==========================================
+// GOOGLE LOGIN CONFIGURATION
+// ==========================================
+
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
+
+const googleClient = GOOGLE_CLIENT_ID
+  ? new OAuth2Client(GOOGLE_CLIENT_ID)
+  : null;
 
 const app = express();
 app.set("trust proxy", 1);
@@ -1493,18 +1503,248 @@ app.post("/api/reset-password", async (req, res) => {
   }
 });
 
+
 // ==========================================
-// LOGIN
+// GOOGLE LOGIN / REGISTER
+// ==========================================
+
+app.post("/api/google-login", async (req, res) => {
+  try {
+    const { credential } = req.body || {};
+
+    if (!GOOGLE_CLIENT_ID || !googleClient) {
+      return res.status(500).json({
+        success: false,
+        error: "Google Login is not configured on server.",
+      });
+    }
+
+    if (!credential || typeof credential !== "string") {
+      return res.status(400).json({
+        success: false,
+        error: "Google credential is required.",
+      });
+    }
+
+    // DEVICE CHECK
+    const deviceInfo = getDeviceInfo(req);
+
+    if (!deviceInfo.installationId) {
+      return res.status(400).json({
+        success: false,
+        error: "Valid installation ID is required.",
+      });
+    }
+
+    const deviceCheck = await checkBannedDevice(
+      deviceInfo.installationId
+    );
+
+    if (deviceCheck.blocked) {
+      return res.status(403).json({
+        success: false,
+        error: "Login blocked on this device.",
+        message: deviceCheck.reason,
+      });
+    }
+
+    // VERIFY GOOGLE ID TOKEN
+    let payload;
+
+    try {
+      const ticket = await googleClient.verifyIdToken({
+        idToken: credential,
+        audience: GOOGLE_CLIENT_ID,
+      });
+
+      payload = ticket.getPayload();
+    } catch (googleError) {
+      console.error("GOOGLE TOKEN VERIFICATION FAILED:", googleError.message);
+
+      return res.status(401).json({
+        success: false,
+        error: "Google verification failed. Please try again.",
+      });
+    }
+
+    if (
+      !payload ||
+      !payload.email ||
+      payload.email_verified !== true
+    ) {
+      return res.status(401).json({
+        success: false,
+        error: "Google email is not verified.",
+      });
+    }
+
+    const cleanEmail = payload.email.toLowerCase().trim();
+
+    // FIND EXISTING ACCOUNT
+    const { data: existingUser, error: findError } = await supabase
+      .from("registeruser")
+      .select("*")
+      .eq("email", cleanEmail)
+      .maybeSingle();
+
+    if (findError) {
+      console.error("GOOGLE USER LOOKUP ERROR:", findError.message);
+
+      return res.status(500).json({
+        success: false,
+        error: "Could not find your account.",
+      });
+    }
+
+    let activeUser;
+
+    if (existingUser) {
+      // Existing unverified account must complete its original OTP flow.
+      if (!existingUser.verified) {
+        return res.status(403).json({
+          success: false,
+          error: "Please verify your email using the registration OTP first.",
+          requiresVerification: true,
+          email: cleanEmail,
+        });
+      }
+
+      // Never overwrite existing password or username.
+      const statusCheck = await checkAccountStatus(existingUser);
+
+      if (!statusCheck.allowed) {
+        return res.status(403).json({
+          success: false,
+          error: statusCheck.message,
+          account_status: statusCheck.user.account_status,
+          suspended_until: statusCheck.user.suspended_until,
+          suspension_reason: statusCheck.user.suspension_reason,
+        });
+      }
+
+      activeUser = statusCheck.user;
+    } else {
+      // GENERATE UNIQUE BGMI PROFILE ID
+      let profile_id = null;
+      let attempts = 0;
+
+      while (attempts < 100) {
+        const generatedId =
+          `BGMI-${userCounter.toString().padStart(4, "0")}`;
+
+        userCounter++;
+
+        const { data: profileCheck, error: profileCheckError } =
+          await supabase
+            .from("registeruser")
+            .select("id")
+            .eq("profile_id", generatedId)
+            .maybeSingle();
+
+        if (profileCheckError) {
+          console.error("GOOGLE PROFILE CHECK ERROR:", profileCheckError.message);
+
+          return res.status(500).json({
+            success: false,
+            error: "Could not create your BGMI profile.",
+          });
+        }
+
+        if (!profileCheck) {
+          profile_id = generatedId;
+          break;
+        }
+
+        attempts++;
+      }
+
+      if (!profile_id) {
+        return res.status(500).json({
+          success: false,
+          error: "BGMI profile ID generation failed.",
+        });
+      }
+
+      const istTime = new Date().toLocaleString("en-IN", {
+        timeZone: "Asia/Kolkata",
+      });
+
+      const googleName =
+        typeof payload.name === "string" && payload.name.trim()
+          ? payload.name.trim().slice(0, 100)
+          : cleanEmail.split("@")[0].slice(0, 100);
+
+      // CREATE GOOGLE USER
+      const { data: newUser, error: insertError } = await supabase
+        .from("registeruser")
+        .insert([
+          {
+            profile_id,
+            username: googleName,
+            email: cleanEmail,
+            "User Password": null,
+            balance: 0,
+            register_time_ist: istTime,
+            verified: true,
+            account_status: "active",
+            suspended_until: null,
+            suspension_reason: null,
+            token_version: 0,
+          },
+        ])
+        .select("*")
+        .single();
+
+      if (insertError || !newUser) {
+        console.error("GOOGLE USER CREATE ERROR:", insertError?.message);
+
+        return res.status(500).json({
+          success: false,
+          error: "Could not create your BGMI account. Please try again.",
+        });
+      }
+
+      activeUser = newUser;
+
+      console.log("GOOGLE ACCOUNT CREATED:", profile_id, cleanEmail);
+    }
+
+    // DEVICE HISTORY
+    await saveUserDevice(deviceInfo, activeUser.profile_id);
+
+    // SAME RESPONSE FORMAT AS PASSWORD LOGIN
+    const { "User Password": _password, ...safeUser } = activeUser;
+
+    return res.json({
+      success: true,
+      user: {
+        ...safeUser,
+        token: generatePlayerToken(activeUser),
+      },
+    });
+  } catch (err) {
+    console.error("GOOGLE LOGIN CRASH:", err);
+
+
+    return res.status(500).json({
+      success: false,
+      error: "Google login failed.",
+    });
+  }
+});
+
+// ==========================================
+// NORMAL EMAIL + PASSWORD LOGIN
 // ==========================================
 
 app.post("/api/login", async (req, res) => {
   try {
-    const { email, password } = req.body;
+    const { email, password } = req.body || {};
 
     if (!email || !password) {
       return res.status(400).json({
         success: false,
-        error: "Email and password required",
+        error: "Email and password are required.",
       });
     }
 
